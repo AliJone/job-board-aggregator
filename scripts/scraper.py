@@ -1,4 +1,4 @@
-import requests, threading, json, random, time, re, os, gzip, argparse, html
+import requests, threading, json, random, time, re, os, gzip, argparse, html, tempfile, csv
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -132,31 +132,54 @@ def load_companies(filepath):
     except FileNotFoundError:
         print(f"File not found: {filepath}")
         return set()
+    
+
+# ============================================================
+# LOAD TECH TITLES FILTER
+# ============================================================
+
+TECH_TITLES_FILE = os.path.join(ROOT_DIR, "data", "tech_job_titles_filtered.csv")
+
+def load_tech_titles(filepath):
+    """Load tech occupation names and job titles from CSV into a lowercase set."""
+    tech_terms = set()
+    try:
+        with open(filepath, mode="r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                occ = (row.get("Occupation") or "").strip().lower()
+                title = (row.get("Job_Title") or "").strip().lower()
+                
+                if len(occ) > 3:
+                    tech_terms.add(occ)
+                if len(title) > 3:
+                    tech_terms.add(title)
+                    
+        print(f"Loaded {len(tech_terms):,} tech title keywords from {filepath}")
+        return tech_terms
+    except FileNotFoundError:
+        print(f"Warning: Tech titles file not found at {filepath}. All titles will be fetched.")
+        return set()
+
+TECH_TITLE_KEYWORDS = load_tech_titles(TECH_TITLES_FILE)
+
+def is_tech_role(job_title):
+    """Check if a scraped job title matches any tech title from the CSV."""
+    if not job_title or not TECH_TITLE_KEYWORDS:
+        return True
+        
+    title_lower = job_title.lower().strip()
+    
+    for keyword in TECH_TITLE_KEYWORDS:
+        if keyword in title_lower:
+            return True
+            
+    return False
 
 
 # ============================================================
 # VERIFY ACTIVE JOBS + FETCH ALL JOBS
 # ============================================================
-
-# API requests for testing in browser console
-"""
-fetch("https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiJobBoardWithTeams", {
-  method: "POST",
-  headers: {"Content-Type": "application/json"},
-  body: JSON.stringify({
-    operationName: "ApiJobBoardWithTeams",
-    variables: {organizationHostedJobsPageName: "zip"},
-    query: "query ApiJobBoardWithTeams($organizationHostedJobsPageName: String!) { jobBoard: jobBoardWithTeams(organizationHostedJobsPageName: $organizationHostedJobsPageName) { jobPostings { id title locationName } } }"
-  })
-}).then(r => r.json()).then(console.log)
-
-fetch("https://{slug}.bamboohr.com/careers/list"){
-    method: "GET",
-    headers: {"Content-Type": "application/json"},
-}.then(r => r.json()).then(console.log)
-
-}
-"""
 
 SOURCE_TYPE = "automated"
 
@@ -171,8 +194,9 @@ def get_job_metadata():
 
 def fetch_company_jobs_greenhouse(slug):
     """Fetch all jobs for a company."""
+    dropped_count = 0
     try:
-        url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
+        url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
         response = requests.get(url, timeout=30)
 
         if response.status_code == 200:
@@ -180,16 +204,24 @@ def fetch_company_jobs_greenhouse(slug):
             jobs = data.get("jobs", [])
 
             if jobs:
-                # Normalize job structure for frontend
                 normalized = []
                 for job in jobs:
+                    title = job.get("title", "")
+                    
+                    if not is_tech_role(title):
+                        dropped_count += 1
+                        continue
+
                     location = job.get("location", {}).get("name", "Not specified")
                     remote, coords = enrich_location(location)
+                    description = job.get("content") or job.get("description") or ""
+                    
                     normalized.append(
                         {
                             "company": slug,
                             "company_slug": slug,
-                            "title": job.get("title"),
+                            "title": title,
+                            "description": description,
                             "location": location,
                             "remote": remote,
                             "coords": coords,
@@ -202,29 +234,28 @@ def fetch_company_jobs_greenhouse(slug):
                             "updated_at": job.get("updated_at"),
                             "is_recruiter": is_recruiter_company(slug),
                             "ats": "Greenhouse",
-                            "skill_level": job_tier_classification(
-                                job.get("title", "")
-                            ),
+                            "skill_level": job_tier_classification(title),
                             **get_job_metadata(),
                         }
                     )
 
-                return slug, normalized, response.status_code
+                return slug, normalized, response.status_code, dropped_count
 
-        return slug, [], response.status_code  # got a response, just not 200
+        return slug, [], response.status_code, dropped_count
 
     except Exception as e:
         print(f"Error fetching Greenhouse for {slug}: {e}")
-    return slug, [], None
+    return slug, [], None, 0
 
 
 def fetch_company_jobs_ashby(slug):
+    dropped_count = 0
     try:
         url = "https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiJobBoardWithTeams"
         payload = {
             "operationName": "ApiJobBoardWithTeams",
             "variables": {"organizationHostedJobsPageName": slug},
-            "query": "query ApiJobBoardWithTeams($organizationHostedJobsPageName: String!) { jobBoard: jobBoardWithTeams(organizationHostedJobsPageName: $organizationHostedJobsPageName) { jobPostings { id title locationName } } }",
+            "query": "query ApiJobBoardWithTeams($organizationHostedJobsPageName: String!) { jobBoard: jobBoardWithTeams(organizationHostedJobsPageName: $organizationHostedJobsPageName) { jobPostings { id title locationName descriptionPlain } } }",
         }
         headers = {
             "Content-Type": "application/json",
@@ -232,7 +263,6 @@ def fetch_company_jobs_ashby(slug):
             "User-Agent": random.choice(USER_AGENTS),
         }
 
-        # Jitter before request to spread out concurrent workers
         time.sleep(random.uniform(0.5, 2.0))
 
         max_retries = 2
@@ -250,11 +280,10 @@ def fetch_company_jobs_ashby(slug):
                     time.sleep(backoff)
                     headers["User-Agent"] = random.choice(USER_AGENTS)
                     continue
-            # Non-retryable status
-            return slug, [], response.status_code
+            return slug, [], response.status_code, 0
 
         if response.status_code != 200:
-            return slug, [], response.status_code
+            return slug, [], response.status_code, 0
 
         data = response.json()
         jobs = (data.get("data") or {}).get("jobBoard") or {}
@@ -263,33 +292,41 @@ def fetch_company_jobs_ashby(slug):
         if jobs:
             normalized = []
             for job in jobs:
+                title = job.get("title", "")
+                
+                if not is_tech_role(title):
+                    dropped_count += 1
+                    continue
+
+                description = job.get("descriptionPlain") or job.get("description") or job.get("content") or ""
+                
                 normalized.append(
                     {
                         "company": slug,
                         "company_slug": slug,
-                        "title": job.get("title", ""),
+                        "title": title,
+                        "description": description,
                         "location": job.get("locationName", "Not specified")[:50],
                         "url": f"https://jobs.ashbyhq.com/{slug}/{job.get('id')}",
                         "is_recruiter": is_recruiter_company(slug),
                         "ats": "Ashby",
-                        "skill_level": job_tier_classification(job.get("title", "")),
+                        "skill_level": job_tier_classification(title),
                         **get_job_metadata(),
                     }
                 )
-            return slug, normalized, response.status_code
+            return slug, normalized, response.status_code, dropped_count
 
-        return slug, [], response.status_code  # got a response, just not 200
+        return slug, [], response.status_code, dropped_count
 
     except Exception as e:
         print(f"Error fetching Ashby for {slug}: {e}")
-    return slug, [], None
+    return slug, [], None, 0
 
 
 def fetch_company_jobs_bamboohr(slug):
     """https://{slug}.bamboohr.com/careers
-    https://{slug}.bamboohr.com/careers/list
-
-    """
+    https://{slug}.bamboohr.com/careers/list"""
+    dropped_count = 0
     url = f"https://{slug}.bamboohr.com/careers/list"
 
     time.sleep(random.uniform(0.5, 2.0))
@@ -306,7 +343,7 @@ def fetch_company_jobs_bamboohr(slug):
 
             if response.status_code == 200:
                 if "application/json" not in response.headers.get("Content-Type", ""):
-                    return slug, [], 404
+                    return slug, [], 404, 0
 
                 data = response.json()
                 jobs = data.get("result", [])
@@ -314,6 +351,12 @@ def fetch_company_jobs_bamboohr(slug):
                 if jobs:
                     normalized = []
                     for job in jobs:
+                        title = job.get("jobOpeningName", "")
+                        
+                        if not is_tech_role(title):
+                            dropped_count += 1
+                            continue
+
                         loc = job.get("location") or {}
                         if isinstance(loc, dict):
                             city = loc.get("city", "")
@@ -326,26 +369,47 @@ def fetch_company_jobs_bamboohr(slug):
                             location = str(loc) if loc else "Not specified"
 
                         remote, coords = enrich_location(location)
+                        
+                        description = ""
+                        job_id = job.get("id")
+                        if job_id:
+                            desc_url = f"https://{slug}.bamboohr.com/careers/{job_id}/detail"
+                            desc_headers = {"Accept": "application/json", "User-Agent": random.choice(USER_AGENTS)}
+                            try:
+                                desc_response = requests.get(desc_url, timeout=30, headers=desc_headers)
+                                if desc_response.status_code == 200:
+                                    desc_data = desc_response.json()
+                                    result = desc_data.get("result", {})
+                                    job_info = result.get("jobOpening") or result
+                                    description = (
+                                        job_info.get("description")
+                                        or job_info.get("content")
+                                        or job_info.get("jobDescription")
+                                        or ""
+                                    )
+                            except Exception:
+                                pass
+                            time.sleep(random.uniform(0.1, 0.3))
+
                         normalized.append(
                             {
                                 "company": slug,
                                 "company_slug": slug,
-                                "title": job.get("jobOpeningName"),
+                                "title": title,
+                                "description": description,
                                 "location": location[:50],
                                 "remote": remote,
                                 "coords": coords,
                                 "url": f"https://{slug}.bamboohr.com/careers/{job.get('id')}",
                                 "is_recruiter": is_recruiter_company(slug),
                                 "ats": "BambooHR",
-                                "skill_level": job_tier_classification(
-                                    job.get("jobOpeningName", "")
-                                ),
+                                "skill_level": job_tier_classification(title),
                                 **get_job_metadata(),
                             }
                         )
-                    return slug, normalized, response.status_code
+                    return slug, normalized, response.status_code, dropped_count
 
-                return slug, [], response.status_code
+                return slug, [], response.status_code, dropped_count
 
             if response.status_code in (429, 503, 502):
                 if attempt < max_retries:
@@ -353,23 +417,23 @@ def fetch_company_jobs_bamboohr(slug):
                     time.sleep(backoff)
                     continue
 
-            return slug, [], response.status_code
+            return slug, [], response.status_code, 0
 
         except requests.exceptions.SSLError:
             if attempt < max_retries:
                 time.sleep((2**attempt) + random.uniform(0.5, 1.5))
                 continue
-            return slug, [], None
+            return slug, [], None, 0
         except Exception as e:
             print(f"Error fetching BambooHR for {slug}: {e}")
-            return slug, [], None
+            return slug, [], None, 0
 
-    return slug, [], None
+    return slug, [], None, 0
 
 
 def fetch_company_jobs_lever(slug):
     """https://api.lever.co/v0/postings/{slug}"""
-
+    dropped_count = 0
     try:
         url = f"https://api.lever.co/v0/postings/{slug}"
         response = requests.get(url, timeout=30)
@@ -380,29 +444,45 @@ def fetch_company_jobs_lever(slug):
             if jobs:
                 normalized = []
                 for job in jobs:
+                    title = job.get("text", "")
+                    
+                    if not is_tech_role(title):
+                        dropped_count += 1
+                        continue
+
                     categories = job.get("categories", {})
                     location = categories.get("location", "Not specified")[:50]
                     remote, coords = enrich_location(location)
+                    
+                    main_desc = job.get("descriptionPlain", "") or job.get("description", "")
+                    lists_text = "\n\n".join([
+                        f"{item.get('text', '')}:\n{item.get('content', '')}" 
+                        for item in job.get("lists", [])
+                    ])
+                    additional = job.get("additionalPlain", "")
+                    description = f"{main_desc}\n\n{lists_text}\n\n{additional}".strip()
+
                     normalized.append(
                         {
                             "company": slug,
                             "company_slug": slug,
-                            "title": job.get("text"),
+                            "title": title,
+                            "description": description,
                             "location": location,
                             "remote": remote,
                             "coords": coords,
                             "url": job.get("hostedUrl"),
                             "is_recruiter": is_recruiter_company(slug),
                             "ats": "Lever",
-                            "skill_level": job_tier_classification(job.get("text", "")),
+                            "skill_level": job_tier_classification(title),
                             **get_job_metadata(),
                         }
                     )
-                return slug, normalized, response.status_code
-        return slug, [], response.status_code  # got a response, just not 200
+                return slug, normalized, response.status_code, dropped_count
+        return slug, [], response.status_code, dropped_count
     except Exception as e:
         print(f"Error fetching Lever for {slug}: {e}")
-    return slug, [], None
+    return slug, [], None, 0
 
 
 def _parse_workday_posted_on(text):
@@ -430,11 +510,11 @@ def fetch_company_jobs_workday(slug):
     slug format: "company|wd#|site_id" e.g. "kohls|wd1|kohlscareers"
     url: https://{company}.wd{num}.myworkdayjobs.com/wday/cxs/{company}/{site_id}/jobs
     """
-
+    dropped_count = 0
     try:
         parts = slug.split("|")
         if len(parts) != 3:
-            return slug, [], None
+            return slug, [], None, 0
 
         company, wd, site_id = parts
         wd_num = wd.replace("wd", "")
@@ -483,25 +563,45 @@ def fetch_company_jobs_workday(slug):
             jobs = data.get("jobPostings", [])
             total = data.get("total", 0)
 
-            # Detect silent blocking / truncation
             if observed_total is None:
                 observed_total = total
             elif total != observed_total:
-                # Workday sometimes lies mid-pagination when blocking
                 break
 
             if not jobs:
                 break
 
             for job in jobs:
+                title = job.get("title", "")
+                
+                if not is_tech_role(title):
+                    dropped_count += 1
+                    continue
+
                 job_path = job.get("externalPath", "")
                 location = (job.get("locationsText") or "Not specified")[:50]
                 remote, coords = enrich_location(location)
+                
+                description = ""
+                if job_path:
+                    detail_url = f"{base_url}/wday/cxs/{company}/{site_id}{job_path}"
+                    try:
+                        detail_resp = requests.get(detail_url, headers=headers, timeout=20)
+                        if detail_resp.status_code == 200:
+                            detail_data = detail_resp.json()
+                            job_info = detail_data.get("jobPostingInfo", {})
+                            description = job_info.get("jobDescription") or job_info.get("description") or ""
+                    except Exception:
+                        pass
+                    
+                    time.sleep(random.uniform(0.1, 0.3))
+                
                 normalized.append(
                     {
                         "company": company,
                         "company_slug": slug,
-                        "title": job.get("title"),
+                        "title": title,
+                        "description": description,
                         "location": location,
                         "remote": remote,
                         "coords": coords,
@@ -509,7 +609,7 @@ def fetch_company_jobs_workday(slug):
                         "updated_at": _parse_workday_posted_on(job.get("postedOn")),
                         "is_recruiter": is_recruiter_company(company),
                         "ats": "Workday",
-                        "skill_level": job_tier_classification(job.get("title", "")),
+                        "skill_level": job_tier_classification(title),
                         **get_job_metadata(),
                     }
                 )
@@ -519,26 +619,21 @@ def fetch_company_jobs_workday(slug):
             if offset >= total:
                 break
 
-            # Jitter between pages (critical)
             time.sleep(random.uniform(0.3, 1.0))
 
-        return slug, normalized, response.status_code
+        return slug, normalized, response.status_code, dropped_count
 
     except Exception:
-        return slug, [], None
+        return slug, [], None, 0
 
 
 def fetch_company_jobs_icims(slug):
     """
     https://careers-{slug}.icims.com/sitemap.xml
-
-    Sitemap contains job URLs like:
-        https://careers-{slug}.icims.com/jobs/9620/financial-service-representative/job
-
-    Title extracted from URL path. Location not available via sitemap. Might look into fetching individual job pages for location,
-    but that would be a lot more requests so skipping for now.
+    Fetches job URLs from sitemap, appends in_iframe=1 to bypass portal shells,
+    and extracts clean description HTML and location data for ALL jobs.
     """
-
+    dropped_count = 0
     sitemap_url = f"https://careers-{slug}.icims.com/sitemap.xml"
     headers = {
         "Accept": "application/xml",
@@ -548,10 +643,14 @@ def fetch_company_jobs_icims(slug):
     try:
         resp = requests.get(sitemap_url, headers=headers, timeout=10)
         if resp.status_code != 200:
-            return slug, [], resp.status_code
+            return slug, [], resp.status_code, 0
 
         root = ET.fromstring(resp.content)
         ns = {"s": "http://www.sitemaps.org/schemas/sitemap/0.9"}
+
+        start_re = re.compile(r'<div[^>]*(?:class|id)="[^"]*iCIMS_(?:JobContent|InfoMsg|JobDetails)[^"]*"[^>]*>', re.IGNORECASE)
+        end_re = re.compile(r'<div[^>]*(?:class|id)="[^"]*iCIMS_(?:JobOptions|PageFooter|BottomHeader)[^"]*"|<!--\s*/?iCIMS_JobContent', re.IGNORECASE)
+        loc_re = re.compile(r'(?:Job\s*)?Location\s*</(?:dt|span|div|b|strong|td|h\d)>\s*<(?:dd|span|div|td|p)[^>]*>\s*([^<]{2,60})', re.IGNORECASE)
 
         normalized = []
         for url_el in root.findall(".//s:url", ns):
@@ -573,6 +672,10 @@ def fetch_company_jobs_icims(slug):
             else:
                 continue
 
+            if not is_tech_role(title):
+                dropped_count += 1
+                continue
+
             lastmod_el = url_el.find("s:lastmod", ns)
             updated_at = (
                 lastmod_el.text.strip()
@@ -580,13 +683,47 @@ def fetch_company_jobs_icims(slug):
                 else None
             )
 
+            description = ""
+            location = "Not specified"
             remote, coords = False, None
+
+            try:
+                time.sleep(random.uniform(0.1, 0.3))  
+                
+                iframe_url = job_url + ("&in_iframe=1" if "?" in job_url else "?in_iframe=1")
+                job_headers = {"User-Agent": random.choice(USER_AGENTS)}
+                job_resp = requests.get(iframe_url, headers=job_headers, timeout=15)
+                
+                if job_resp.status_code == 200:
+                    page_text = job_resp.text
+                    
+                    start_match = start_re.search(page_text)
+                    if start_match:
+                        raw_body = page_text[start_match.end():]
+                        end_match = end_re.search(raw_body)
+                        if end_match:
+                            raw_body = raw_body[:end_match.start()]
+                        clean_desc = re.sub(r'<(?:script|style)[^>]*>.*?</(?:script|style)>', '', raw_body, flags=re.DOTALL | re.IGNORECASE)
+                        description = clean_desc.strip()
+                    
+                    loc_match = loc_re.search(page_text)
+                    if not loc_match:
+                        loc_match = re.search(r'Job\s*Location\s*[:\|\-]\s*([A-Za-z0-9\s,\-\/\(\)]{2,60}?)(?:\r|\n|<|$)', page_text, re.IGNORECASE)
+                    
+                    if loc_match:
+                        location = loc_match.group(1).strip()
+                        remote, coords = enrich_location(location)
+                        
+            except Exception:
+                pass
+
             normalized.append(
                 {
                     "company": slug,
                     "company_slug": slug,
                     "title": title,
-                    "location": "Not specified",
+                    "description": description,
+                    "location": location[:50],
                     "remote": remote,
                     "coords": coords,
                     "url": job_url,
@@ -598,14 +735,11 @@ def fetch_company_jobs_icims(slug):
                 }
             )
 
-        return slug, normalized, resp.status_code
+        return slug, normalized, resp.status_code, dropped_count
 
     except Exception as e:
         print(f"Error fetching iCIMS for {slug}: {e}")
-        return slug, [], None
-
-
-# TODO - Add Workable
+        return slug, [], None, 0
 
 
 def _paylocity_location(j):
@@ -623,9 +757,9 @@ def _paylocity_location(j):
 def fetch_company_jobs_paylocity(slug):
     """slug is the Paylocity tenant GUID. Jobs come from window.pageData in the
     page HTML, not a JSON API. Name is resolved from PAYLOCITY_NAMES."""
+    dropped_count = 0
     url = f"https://recruiting.paylocity.com/recruiting/jobs/All/{slug}/"
     session = _paylocity_session()
-    # jitter so concurrent workers don't fire in lockstep
     time.sleep(random.uniform(0.5, 2.0))
     max_retries = 3
     for attempt in range(max_retries + 1):
@@ -633,7 +767,6 @@ def fetch_company_jobs_paylocity(slug):
         try:
             response = session.get(url, timeout=30, headers=headers)
         except requests.RequestException as e:
-            # reset/abort = throttling. drop the poisoned connection, back off, retry.
             try:
                 session.close()
             except Exception:
@@ -644,32 +777,38 @@ def fetch_company_jobs_paylocity(slug):
                 time.sleep((2**attempt) + random.uniform(1.0, 2.0))
                 continue
             print(f"Error fetching Paylocity for {slug}: {e}")
-            return slug, [], None
+            return slug, [], None, 0
         if response.status_code in (429, 503, 502):
             if attempt < max_retries:
                 time.sleep((2**attempt) + random.uniform(1.0, 2.0))
                 continue
-            return slug, [], response.status_code
+            return slug, [], response.status_code, 0
         if response.status_code != 200:
-            return slug, [], response.status_code
+            return slug, [], response.status_code, 0
         m = PAGEDATA_RE.search(response.text)
         if not m:
-            # page loaded but blob missing = soft block or layout drift.
-            # return 200 so it retries next run, NOT cached as dead.
-            return slug, [], 200
+            return slug, [], 200, 0
         try:
             data = json.loads(m.group(1))
         except ValueError:
-            return slug, [], 200
+            return slug, [], 200, 0
         company = PAYLOCITY_NAMES.get(slug, slug)
+        
+        json_ld_re = re.compile(r'<script\s+type="application/ld\+json"\s*>(.*?)</script>', re.DOTALL | re.IGNORECASE)
+        
         normalized = []
         for job in data.get("Jobs") or []:
-            job_id = job.get("JobId")
             title = html.unescape(job.get("JobTitle") or "")
+            
+            if not is_tech_role(title):
+                dropped_count += 1
+                continue
+
+            job_id = job.get("JobId")
             location = _paylocity_location(job)
             inferred_remote, coords = enrich_location(location)
             remote = bool(job.get("IsRemote")) or inferred_remote
-            dept = job.get("HiringDepartment")  # almost always null on Paylocity
+            dept = job.get("HiringDepartment")
             if dept:
                 dept = html.unescape(dept)
             detail = (
@@ -677,11 +816,50 @@ def fetch_company_jobs_paylocity(slug):
                 if job_id
                 else url
             )
+            
+            description = ""
+            if job_id and not description:
+                try:
+                    time.sleep(random.uniform(0.1, 0.3))
+                    detail_resp = session.get(detail, headers=headers, timeout=15)
+                    if detail_resp.status_code == 200:
+                        page_text = detail_resp.text
+                        
+                        ld_match = json_ld_re.search(page_text)
+                        if ld_match:
+                            try:
+                                ld_data = json.loads(ld_match.group(1).strip())
+                                description = ld_data.get("description", "")
+                            except (json.JSONDecodeError, AttributeError):
+                                pass
+                        
+                        if not description:
+                            dm = PAGEDATA_RE.search(page_text)
+                            if dm:
+                                try:
+                                    detail_data = json.loads(dm.group(1))
+                                    description = (
+                                        detail_data.get("Description") 
+                                        or detail_data.get("Job", {}).get("Description") 
+                                        or detail_data.get("jobDescription") 
+                                        or ""
+                                    )
+                                except ValueError:
+                                    pass
+                                    
+                        if not description:
+                            html_match = re.search(r'class="[^"]*(?:job-details-description|preview-text|job-description)[^"]*"[^>]*>(.*?)</div', page_text, re.DOTALL | re.IGNORECASE)
+                            if html_match:
+                                description = html_match.group(1).strip()
+                except Exception:
+                    pass
+
             normalized.append(
                 {
                     "company": company,
-                    "company_slug": slug,  # the GUID
+                    "company_slug": slug,
                     "title": title,
+                    "description": description,
                     "location": location,
                     "remote": remote,
                     "coords": coords,
@@ -696,11 +874,10 @@ def fetch_company_jobs_paylocity(slug):
                     **get_job_metadata(),
                 }
             )
-        return slug, normalized, response.status_code
-    return slug, [], None
+        return slug, normalized, response.status_code, dropped_count
+    return slug, [], None, 0
 
-
-def fetch_all_jobs(companies, fetcher, platform="ATS"):
+def fetch_all_jobs(companies, fetcher, platform="ATS", max_jobs_per_provider=None):
     """Fetch jobs from all companies in parallel."""
     print("=" * 80)
     print(f"FETCHING JOBS FROM {len(companies):,} COMPANIES FROM PLATFORM: {platform}")
@@ -708,7 +885,6 @@ def fetch_all_jobs(companies, fetcher, platform="ATS"):
 
     platform_lower = platform.lower()
 
-    # Skip known dead slugs
     dead_slugs = load_dead_slugs(platform_lower)
     live_companies = [s for s in companies if s not in dead_slugs]
     if dead_slugs:
@@ -719,6 +895,9 @@ def fetch_all_jobs(companies, fetcher, platform="ATS"):
     active_companies = {}
     failed = 0
     new_dead = set()
+
+    total_kept = 0
+    total_dropped = 0
 
     MAX_WORKERS = {
         "bamboohr": 10,
@@ -736,35 +915,42 @@ def fetch_all_jobs(companies, fetcher, platform="ATS"):
         futures = {executor.submit(fetcher, slug): slug for slug in live_companies}
 
         for i, future in enumerate(as_completed(futures), 1):
+            slug, jobs, status_code, dropped_count = future.result()
 
-            # fetcher returns slug, jobs, status_code (if implemented)
-            slug, jobs, status_code = future.result()
+            total_dropped += dropped_count
 
             if jobs:
+                remaining_budget = None
+                if max_jobs_per_provider is not None:
+                    remaining_budget = max_jobs_per_provider - len(all_jobs)
+                    if remaining_budget <= 0:
+                        break
+                if max_jobs_per_provider is not None and jobs:
+                    jobs = jobs[:remaining_budget]
                 all_jobs.extend(jobs)
                 active_companies[slug] = len(jobs)
-                print(f"  [{i}/{len(live_companies)}] {slug}: {len(jobs)} jobs")
+                total_kept += len(jobs)
             else:
                 failed += 1
-                # Only cache permanent failures
                 if status_code in (404, 410):
                     new_dead.add(slug)
-                if i % 50 == 0:
-                    print(
-                        f"  [{i}/{len(live_companies)}] Checked... ({failed} inactive)"
-                    )
 
-    # Update dead slug cache
+            if (i & (i - 1)) == 0 or (i % 250 == 0) or i == len(live_companies):
+                print(
+                    f"  [{i:,}/{len(live_companies):,}] Kept: {total_kept:,} tech jobs | Dropped: {total_dropped:,} non-tech jobs | Inactive: {failed:,} companies"
+                )
+
     if new_dead:
         all_dead = dead_slugs | new_dead
         save_dead_slugs(platform_lower, all_dead)
 
     print(f"\nDETAILED STATS FOR {platform}:")
-    print(f"  Companies checked: {len(live_companies)}")
-    print(f"  Companies with jobs: {len(active_companies)}")
-    print(f"  Failed/empty: {failed}")
-    print(f"  Newly dead: {len(new_dead)}")
-    print(f"  Total jobs: {len(all_jobs)}")
+    print(f"  Companies checked:        {len(live_companies):,}")
+    print(f"  Companies with tech jobs: {len(active_companies):,}")
+    print(f"  Failed/empty companies:   {failed:,}")
+    print(f"  Newly cached dead slugs:  {len(new_dead):,}")
+    print(f"  Total tech jobs kept:     {len(all_jobs):,}")
+    print(f"  Total non-tech dropped:   {total_dropped:,}")
 
     return active_companies, all_jobs
 
@@ -774,42 +960,371 @@ def fetch_all_jobs(companies, fetcher, platform="ATS"):
 # ============================================================
 def is_recruiter_company(slug):
     slug = slug.lower()
-
-    # Keyword-based detection
     if any(term in slug for term in RECRUITER_TERMS):
         return True
-
     return False
 
 
+def _compile_bucket_patterns(patterns):
+    return [re.compile(pattern, re.IGNORECASE) for pattern in patterns]
+
+
+LEAD_INTENT_BUCKETS = {
+    "highScale": _compile_bucket_patterns([
+        r"\b(asynchronous callbacks)\b",
+        r"\b(asynchronous processing)\b",
+        r"\b(background jobs)\b",
+        r"\b(background tasks)\b",
+        r"\b(cluster architecture)\b",
+        r"\b(cold start mitigation)\b",
+        r"\b(concurrency control)\b",
+        r"\b(concurrency primitives)\b",
+        r"\b(concurrent requests)\b",
+        r"\b(concurrent test suites)\b",
+        r"\b(connection pool exhaustion)\b",
+        r"\b(connection pooling)\b",
+        r"\b(distributed architecture)\b",
+        r"\b(distributed computing)\b",
+        r"\b(distributed execution)\b",
+        r"\b(distributed state)\b",
+        r"\b(distributed systems)\b",
+        r"\b(distributed task queue)\b",
+        r"\b(durable execution)\b",
+        r"\b(durable workflows)\b",
+        r"\b(edge computing)\b",
+        r"\b(edge optimization)\b",
+        r"\b(event loop blocking)\b",
+        r"\b(event streams)\b",
+        r"\b(event-driven architecture)\b",
+        r"\b(event-driven pipelines)\b",
+        r"\b(execution speed)\b",
+        r"\b(fault-tolerant systems)\b",
+        r"\b(gpu scheduling)\b",
+        r"\b(high availability)\b",
+        r"\b(high throughput)\b",
+        r"\b(high-throughput systems)\b",
+        r"\b(horizontally scalable)\b",
+        r"\b(in-memory processing)\b",
+        r"\b(latency optimization)\b",
+        r"\b(lock contention)\b",
+        r"\b(log ingestion)\b",
+        r"\b(low latency)\b",
+        r"\b(low-latency apis)\b",
+        r"\b(memory leaks)\b",
+        r"\b(memory management)\b",
+        r"\b(message broker)\b",
+        r"\b(microservice architectures)\b",
+        r"\b(multi-threading)\b",
+        r"\b(non-blocking i\/o)\b",
+        r"\b(queue management)\b",
+        r"\b(race conditions)\b",
+        r"\b(rate limiting)\b",
+        r"\b(real-time inference)\b",
+        r"\b(real-time interaction)\b",
+        r"\b(serverless functions)\b",
+        r"\b(serverless execution)\b",
+        r"\b(state machines)\b",
+        r"\b(stateful inference)\b",
+        r"\b(stateless functions)\b",
+        r"\b(thread pool)\b",
+        r"\b(worker threads)\b",
+    ]),
+    "dataIntegrity": _compile_bucket_patterns([
+        r"\b(append-only event log)\b",
+        r"\b(audit trail)\b",
+        r"\b(auditable data models)\b",
+        r"\b(background jobs system)\b",
+        r"\b(complex data engines)\b",
+        r"\b(data infrastructure)\b",
+        r"\b(data ingestion)\b",
+        r"\b(data pipeline concepts)\b",
+        r"\b(data synchronization)\b",
+        r"\b(database connections)\b",
+        r"\b(distributed etl)\b",
+        r"\b(elt workflows)\b",
+        r"\b(entity resolution)\b",
+        r"\b(etl \/ elt)\b",
+        r"\b(etl workflows)\b",
+        r"\b(event-driven log processing)\b",
+        r"\b(high-throughput data pipelines)\b",
+        r"\b(highly reliable)\b",
+        r"\b(idempotent csv imports)\b",
+        r"\b(lockstep synchronization)\b",
+        r"\b(log ingestion pipelines)\b",
+        r"\b(messy data)\b",
+        r"\b(multi-platform synchronization)\b",
+        r"\b(observability and logging)\b",
+        r"\b(on-chain data indexing)\b",
+        r"\b(persistent connections)\b",
+        r"\b(pipeline engineering)\b",
+        r"\b(real-world datasets)\b",
+        r"\b(relational data modeling)\b",
+        r"\b(resilient sync layer)\b",
+        r"\b(schema migrations)\b",
+        r"\b(state updates)\b",
+        r"\b(structured extraction)\b",
+        r"\b(sync layer)\b",
+        r"\b(transaction processing)\b",
+        r"\b(transaction safety)\b",
+        r"\b(transactional guarantees)\b",
+        r"\b(transactional safety)\b",
+        r"\b(unstructured sources)\b",
+        r"\b(workflow automation)\b",
+        r"\b(workflow integrations)\b",
+    ]),
+    "hardSecurity": _compile_bucket_patterns([
+        r"\b(access control)\b",
+        r"\b(asynchronous updates)\b",
+        r"\b(authorization capabilities)\b",
+        r"\b(dedicated api routes)\b",
+        r"\b(dynamic claims engines)\b",
+        r"\b(edge optimization)\b",
+        r"\b(fault-tolerant)\b",
+        r"\b(fine grained access)\b",
+        r"\b(hipaa-aware)\b",
+        r"\b(idempotency)\b",
+        r"\b(idempotent endpoints)\b",
+        r"\b(idempotent replay patterns)\b",
+        r"\b(idempotent upsert)\b",
+        r"\b(identity systems)\b",
+        r"\b(jwt\/rbac authentication)\b",
+        r"\b(key rotation)\b",
+        r"\b(microservice communication)\b",
+        r"\b(multi-tenant architecture)\b",
+        r"\b(multi-tenant by)\b",
+        r"\b(multi-tenant identity)\b",
+        r"\b(multi-tenant isolation)\b",
+        r"\b(multi-tenant saas)\b",
+        r"\b(multi-tenant security)\b",
+        r"\b(oauth 2\.0)\b",
+        r"\b(oidc flows)\b",
+        r"\b(partial failures)\b",
+        r"\b(pragmatic security)\b",
+        r"\b(retries and fallbacks)\b",
+        r"\b(role-based access)\b",
+        r"\b(role-based systems)\b",
+        r"\b(row-level security)\b",
+        r"\b(secure integrations)\b",
+        r"\b(security invoker)\b",
+        r"\b(signature validation)\b",
+        r"\b(sso integration)\b",
+        r"\b(strong tenant isolation)\b",
+        r"\b(tenant isolation)\b",
+        r"\b(webhook architecture)\b",
+        r"\b(webhook ordering)\b",
+        r"\b(webhook sigs)\b",
+        r"\b(webhook signature validation)\b",
+        r"\b(workload identity)\b",
+    ]),
+    "technicalDebt": _compile_bucket_patterns([
+        r"\b(aggressively refactor)\b",
+        r"\b(architecture decisions)\b",
+        r"\b(bottlenecks)\b",
+        r"\b(builder mentality)\b",
+        r"\b(code stagnation)\b",
+        r"\b(completely overhaul)\b",
+        r"\b(complex workflows)\b",
+        r"\b(core infrastructure)\b",
+        r"\b(duct-tape fix)\b",
+        r"\b(end-to-end delivery)\b",
+        r"\b(failing test)\b",
+        r"\b(founding engineer autonomy)\b",
+        r"\b(founding urgency)\b",
+        r"\b(go 0 to 1)\b",
+        r"\b(legacy monoliths)\b",
+        r"\b(major scalability win)\b",
+        r"\b(major technical decisions)\b",
+        r"\b(messy data)\b",
+        r"\b(messy ownership)\b",
+        r"\b(messy real-world)\b",
+        r"\b(migration)\b",
+        r"\b(modernize legacy)\b",
+        r"\b(operational edge cases)\b",
+        r"\b(overhaul)\b",
+        r"\b(production-quality code)\b",
+        r"\b(production-ready)\b",
+        r"\b(rebuild the prototype)\b",
+        r"\b(refactor aggressively)\b",
+        r"\b(rewrite that buys)\b",
+        r"\b(rewrite the prototype)\b",
+        r"\b(rock-solid)\b",
+        r"\b(scaling bottlenecks)\b",
+        r"\b(ship imperfect)\b",
+        r"\b(spaghetti code)\b",
+        r"\b(systems foundation)\b",
+        r"\b(technical debt)\b",
+        r"\b(trail of technical debt)\b",
+        r"\b(turn messy)\b",
+        r"\b(unglamorous work)\b",
+        r"\b(unstable prototype)\b",
+        r"\b(zero to one)\b",
+    ]),
+    "manualArchitecture": _compile_bucket_patterns([
+        r"\b(concurrency)\b",
+        r"\b(race conditions)\b",
+        r"\b(thread-safe)\b",
+        r"\b(grpc)\b",
+        r"\b(protocol buffers)\b",
+        r"\b(websockets)\b",
+        r"\b(idempotency)\b",
+        r"\b(message queues)\b",
+        r"\b(rabbitmq)\b",
+        r"\b(kafka)\b",
+        r"\b(database indexing)\b",
+        r"\b(query optimization)\b",
+        r"\b(acid)\b",
+        r"\b(multi-tenant)\b",
+        r"\b(rbac)\b",
+        r"\b(role-based access control)\b",
+    ]),
+    "noiseFilter": _compile_bucket_patterns([
+        r"\b(bubble\.io)\b",
+        r"\b(build a landing page)\b",
+        r"\b(cms integration)\b",
+        r"\b(css fixes)\b",
+        r"\b(elementor)\b",
+        r"\b(figma to html)\b",
+        r"\b(figma to react)\b",
+        r"\b(framer x)\b",
+        r"\b(framer)\b",
+        r"\b(freelance web designer)\b",
+        r"\b(front-end assembly)\b",
+        r"\b(html css javascript)\b",
+        r"\b(html\/css tweaks)\b",
+        r"\b(landing page optimization)\b",
+        r"\b(landing page)\b",
+        r"\b(low-code)\b",
+        r"\b(marketing site)\b",
+        r"\b(no-code app)\b",
+        r"\b(no-code builder)\b",
+        r"\b(no-code tools)\b",
+        r"\b(no-code)\b",
+        r"\b(pixel perfect)\b",
+        r"\b(shopify theme)\b",
+        r"\b(simple layout change)\b",
+        r"\b(simple wrapper)\b",
+        r"\b(squarespace)\b",
+        r"\b(static assets only)\b",
+        r"\b(static site)\b",
+        r"\b(tailwind components)\b",
+        r"\b(theme customization)\b",
+        r"\b(thin ai wrapper)\b",
+        r"\b(thin wrapper)\b",
+        r"\b(ui adjustments)\b",
+        r"\b(ui tweaks)\b",
+        r"\b(webflow builder)\b",
+        r"\b(webflow developer)\b",
+        r"\b(webflow)\b",
+        r"\b(wix)\b",
+        r"\b(wordpress backend)\b",
+        r"\b(wordpress theme)\b",
+        r"\b(wordpress)\b",
+        r"\b(prompt tuning)\b",
+        r"\b(ai integration)\b",
+        r"\b(chatbot ui)\b",
+        r"\b(rest api consumption)\b",
+        r"\b(third-party api)\b",
+        r"\b(zapier)\b",
+        r"\b(make\.com)\b",
+        r"\b(no-code workflow)\b",
+        r"\b(figma to webflow)\b",
+    ]),
+}
+
+LEAD_INTENT_WEIGHTS = {
+    "highScale": 2,
+    "dataIntegrity": 2,
+    "hardSecurity": 3,
+    "technicalDebt": 4,
+    "manualArchitecture": 2,
+    "noiseFilter": -10,
+}
+
+
+def normalize_for_scoring(text):
+    """
+    Ultra-robust text cleaning to ensure keywords are matched regardless
+    of HTML tags, Markdown, line breaks, weird spacing, or special formatting.
+    """
+    if not text:
+        return ""
+    
+    # 1. Unescape HTML entities (e.g., &amp;, &nbsp;, &#39;, &#8208; for hyphen)
+    cleaned = html.unescape(str(text))
+    cleaned = html.unescape(cleaned)  # Double pass catches double-encoded entities like &amp;quot;
+    
+    # 2. Remove invisible zero-width formatting characters (common in pasted rich text)
+    cleaned = re.sub(r'[\u200b\u200c\u200d\ufeff\u200e\u2060]', '', cleaned)
+    
+    # 3. Strip all HTML/XML tags, replacing them with a space so words don't fuse together
+    #    (e.g., "systems</li><li>concurrent" becomes "systems concurrent")
+    cleaned = re.sub(r'<[^>]+>', ' ', cleaned)
+    
+    # 4. Normalize line breaks, tabs, non-breaking spaces, and multiple spaces to a single standard space
+    cleaned = re.sub(r'\s+', ' ', cleaned)
+    
+    return cleaned.strip().lower()
+
+
+def evaluate_lead_intent(job):
+    """Score a job based on the configured lead-intent buckets."""
+    title = job.get("title") or ""
+    description = job.get("description") or job.get("description_text") or ""
+    company = job.get("company") or job.get("company_slug") or ""
+    
+    # Run our bulletproof normalization across all combined fields
+    raw_text = f"{title} {description} {company}"
+    clean_text = normalize_for_scoring(raw_text)
+
+    matches = {}
+    score = 0
+    for bucket, patterns in LEAD_INTENT_BUCKETS.items():
+        hit_count = sum(1 for pattern in patterns if pattern.search(clean_text))
+        matches[bucket] = (hit_count > 0)
+        if hit_count > 0:
+            if bucket == "noiseFilter":
+                score += LEAD_INTENT_WEIGHTS[bucket]
+            else:
+                score += LEAD_INTENT_WEIGHTS[bucket] * min(hit_count, 3)
+
+    return {
+        "score": score,
+        "matches": matches,
+        "is_excluded": bool(matches.get("noiseFilter")),
+    }
+
+
 def clean_job_data(jobs):
-    """Remove invalid/useless job entries."""
+    """Remove invalid/useless job entries and apply lead-intent filtering."""
     cleaned = []
-    skipped_reasons = {"no_title": 0, "no_url": 0, "no_company": 0}
+    skipped_reasons = {"no_title": 0, "no_url": 0, "no_company": 0, "low_signal": 0}
 
     for job in jobs:
         title = (job.get("title") or "").strip().lower()
         url = job.get("url") or job.get("absolute_url")
         company = job.get("company") or job.get("company_slug")
 
-        # Skip jobs with invalid titles
         if not title or title in ["not specified", "n/a", "unknown", ""]:
             skipped_reasons["no_title"] += 1
             continue
 
-        # Skip jobs without URLs
         if not url:
             skipped_reasons["no_url"] += 1
             continue
 
-        # Skip jobs without company info
         if not company:
             skipped_reasons["no_company"] += 1
             continue
 
+        scoring = evaluate_lead_intent(job)
+        job["lead_intent_score"] = scoring["score"]
+        job["lead_intent_matches"] = scoring.get("matches", {})
+        if scoring["is_excluded"]:
+            skipped_reasons["low_signal"] += 1
+            continue
+
         cleaned.append(job)
 
-    # Print summary
     total_skipped = sum(skipped_reasons.values())
     if total_skipped > 0:
         print(f"\n  Skipped {total_skipped:,} invalid jobs:")
@@ -817,10 +1332,10 @@ def clean_job_data(jobs):
             if count > 0:
                 print(f"    - {reason.replace('_', ' ').title()}: {count:,}")
 
+    cleaned.sort(key=lambda job: (-(job.get("lead_intent_score", 0)), (job.get("company") or "").lower(), (job.get("title") or "").lower()))
     return cleaned
 
 
-# module level, compiled once
 _TIER_PATTERNS = [
     (re.compile(r"\b(?:chief|cto|ceo|cfo|vp|vice president|director)\b"), 50),
     (re.compile(r"\b(?:principal|distinguished|fellow)\b"), 40),
@@ -882,11 +1397,44 @@ def load_dead_slugs(platform):
         return set()
 
 
+def write_json_file(path, payload):
+    """Write JSON to disk, recovering from permission and ownership issues."""
+    path = os.fspath(path)
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+
+    temp_path = None
+    try:
+        fd, temp_path = tempfile.mkstemp(prefix=".tmp-", dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+
+        if os.path.exists(path):
+            os.replace(temp_path, path)
+        else:
+            os.replace(temp_path, path)
+        temp_path = None
+    except PermissionError as exc:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise RuntimeError(f"Unable to write JSON file: {path}") from exc
+    except OSError as exc:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+        raise RuntimeError(f"Unable to write JSON file: {path}") from exc
+
+
 def save_dead_slugs(platform, slugs):
     """Save dead slugs for a platform."""
     filepath = os.path.join(DEAD_SLUG_DIR, f"{platform}.json")
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(sorted(slugs), f, ensure_ascii=False, indent=2)
+    write_json_file(filepath, sorted(slugs))
     print(f"  Cached {len(slugs):,} dead slugs for {platform}")
 
 
@@ -901,24 +1449,25 @@ def save_results(all_companies, active_companies, all_jobs):
 
     original_count = len(all_jobs)
     all_jobs = clean_job_data(all_jobs)
+    all_jobs = sorted(
+        all_jobs,
+        key=lambda job: (-(job.get("lead_intent_score", 0)), (job.get("company") or "").lower(), (job.get("title") or "").lower()),
+    )
     cleaned_count = original_count - len(all_jobs)
-    print(f"Removed {cleaned_count:,} invalid jobs (blank/not specified titles)")
+    print(
+        f"Collected {original_count:,} jobs before filtering; kept {len(all_jobs):,} after cleaning; removed {cleaned_count:,}"
+    )
 
     timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-    # Save all companies list
     companies_file = os.path.join(OUTPUT_DIR, "all_companies.json")
-    with open(companies_file, "w", encoding="utf-8") as f:
-        json.dump(sorted(list(all_companies)), f, ensure_ascii=False, indent=2)
+    write_json_file(companies_file, sorted(list(all_companies)))
     print(f"All companies: {companies_file}")
 
-    # Save active companies with job counts
     active_file = os.path.join(OUTPUT_DIR, "active_companies.json")
-    with open(active_file, "w", encoding="utf-8") as f:
-        json.dump(active_companies, f, ensure_ascii=False, indent=2, sort_keys=True)
+    write_json_file(active_file, active_companies)
     print(f"Active companies: {active_file}")
 
-    # Load salary lookup once
     salary_lookup_path = os.path.join(ROOT_DIR, "data", "salary", "salary_lookup.json")
     salary_lookup = {}
     salary_fallback = {}
@@ -929,7 +1478,6 @@ def save_results(all_companies, active_companies, all_jobs):
             salary_fallback = data.get("fallback", {})
         print(f"Loaded {len(salary_lookup):,} salary entries")
 
-    # Enrich jobs with salary data
     for job in all_jobs:
         company = (job.get("company") or "").lower().strip()
         title = (job.get("title") or "").lower().strip()
@@ -942,16 +1490,24 @@ def save_results(all_companies, active_companies, all_jobs):
             fallback_key
         )
 
-    # Save all jobs
+    for job in all_jobs:
+        job["lead_intent_score"] = int(job.get("lead_intent_score", 0))
+
     all_jobs_file = os.path.join(OUTPUT_DIR, "all_jobs.json")
-    with open(all_jobs_file, "w", encoding="utf-8") as f:
-        json.dump(all_jobs, f, ensure_ascii=False, indent=2)
+    write_json_file(all_jobs_file, all_jobs)
     print(f"All jobs: {all_jobs_file} ({len(all_jobs):,} jobs)")
 
-    # Build slim version for frontend
+    def clean_for_frontend(text):
+        if not text:
+            return ""
+        no_html = re.sub(r"<[^>]+>", " ", str(text))
+        clean = re.sub(r"\s+", " ", html.unescape(no_html)).strip()
+        return clean[:1500] if len(clean) > 1500 else clean
+
     FRONTEND_FIELDS = {
         "title",
         "company",
+        "description",
         "location",
         "url",
         "ats",
@@ -964,27 +1520,27 @@ def save_results(all_companies, active_companies, all_jobs):
         "salary",
         "updated_at",
         "first_seen",
+        "lead_intent_score",
     }
 
-    slim_jobs = [
-        {k: job.get(k) for k in FRONTEND_FIELDS if k in job} for job in all_jobs
-    ]
+    slim_jobs = []
+    for job in all_jobs:
+        slim = {k: job.get(k) for k in FRONTEND_FIELDS if k in job}
+        if "description" in slim:
+            slim["description"] = clean_for_frontend(slim["description"])
+        slim_jobs.append(slim)
 
-    # Pre-sort by company name for better frontend caching
     slim_jobs.sort(
         key=lambda x: (x.get("company", "").lower(), x.get("title", "").lower())
     )
 
-    # Chunks go in a subdirectory to keep the output folder organized
     chunks_dir = os.path.join(OUTPUT_DIR, "chunks")
     os.makedirs(chunks_dir, exist_ok=True)
 
-    # Remove old chunk files to prevent confusion and save space
     for old_chunk in os.listdir(chunks_dir):
         if old_chunk.startswith("jobs_chunk_") and old_chunk.endswith(".json.gz"):
             os.remove(os.path.join(chunks_dir, old_chunk))
 
-    # Split into chunks of ~25k for frontend loading (with gzip compression)
     CHUNK_SIZE = 25_000
 
     chunks = [
@@ -1000,19 +1556,16 @@ def save_results(all_companies, active_companies, all_jobs):
         size_mb = os.path.getsize(chunk_file) / (1024 * 1024)
         print(f"  Chunk {idx}: {len(chunk):,} jobs ({size_mb:.1f}MB)")
 
-    # Manifest so the frontend knows what to load
     manifest = {
         "chunks": chunk_filenames,
         "totalJobs": len(slim_jobs),
         "last_updated": timestamp,
     }
     manifest_file = os.path.join(chunks_dir, "jobs_manifest.json")
-    with open(manifest_file, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    write_json_file(manifest_file, manifest)
 
     recruiter_jobs = sum(1 for job in all_jobs if job.get("is_recruiter"))
 
-    # Save metadata summary
     metadata = {
         "last_updated": timestamp,
         "total_companies": len(all_companies),
@@ -1024,20 +1577,18 @@ def save_results(all_companies, active_companies, all_jobs):
     }
 
     metadata_file = os.path.join(OUTPUT_DIR, "metadata.json")
-    with open(metadata_file, "w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
+    write_json_file(metadata_file, metadata)
     print(f"Metadata: {metadata_file}")
 
     print()
 
 
-def main():
+def main(max_jobs_per_provider=None):
     print("\n" + "=" * 80)
     print("JOB BOARD AGGREGATOR")
     print("Scraping all jobs from ATS companies")
     print("=" * 80)
 
-    # Load existing companies
     greenhouse_companies = load_companies(GREENHOUSE_FILE)
     ashby_companies = load_companies(ASHBY_FILE)
     bamboohr_companies = load_companies(BAMBOOHR_FILE)
@@ -1058,7 +1609,6 @@ def main():
         print("Exiting - no companies loaded!")
         return
 
-    # Define all platform jobs
     platforms = [
         (greenhouse_companies, fetch_company_jobs_greenhouse, "GREENHOUSE"),
         (ashby_companies, fetch_company_jobs_ashby, "ASHBY"),
@@ -1069,13 +1619,12 @@ def main():
         (paylocity_companies, fetch_company_jobs_paylocity, "PAYLOCITY"),
     ]
 
-    # Run all platforms concurrently
     all_active_companies = {}
     all_jobs = []
 
     with ThreadPoolExecutor(max_workers=len(platforms)) as platform_executor:
         futures = {
-            platform_executor.submit(fetch_all_jobs, companies, fetcher, name): name
+            platform_executor.submit(fetch_all_jobs, companies, fetcher, name, max_jobs_per_provider): name
             for companies, fetcher, name in platforms
         }
 
@@ -1085,10 +1634,9 @@ def main():
             all_active_companies.update(active)
             all_jobs.extend(jobs)
             print(
-                f"\n  >>> {name} COMPLETE: {len(active):,} active, {len(jobs):,} jobs <<<\n"
+                f"\n  >>> {name} COMPLETE: {len(active):,} active, {len(jobs):,} tech jobs <<<\n"
             )
 
-    # Combine all company sets for total count
     all_companies = (
         greenhouse_companies
         | ashby_companies
@@ -1101,13 +1649,12 @@ def main():
 
     save_results(all_companies, all_active_companies, all_jobs)
 
-    # Final summary
     print("=" * 80)
     print("FINAL SUMMARY")
     print("=" * 80)
     print(f"Total companies:   {len(all_companies):,}")
     print(f"Active companies:  {len(all_active_companies):,}")
-    print(f"Total jobs:        {len(all_jobs):,}")
+    print(f"Total tech jobs:   {len(all_jobs):,}")
     print(f"\nAll data saved to '{OUTPUT_DIR}/' directory")
     print("=" * 80 + "\n")
 
@@ -1120,10 +1667,16 @@ if __name__ == "__main__":
         default="automated",
         help="Source type: automated (GitHub Actions) or manual (local run)",
     )
+    parser.add_argument(
+        "--max-jobs-per-provider",
+        type=int,
+        default=None,
+        help="Optional cap on how many jobs to collect per provider before moving on (useful for testing)",
+    )
 
     args = parser.parse_args()
     SOURCE_TYPE = args.source
 
     print(f"\nRunning in {SOURCE_TYPE.upper()} mode\n")
 
-    main()
+    main(max_jobs_per_provider=args.max_jobs_per_provider)

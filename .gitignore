@@ -85,4 +85,8 @@ data/*.py
 /city_aggregator/*.csv
 /city_aggregator/*.py
 /city_aggregator/admin1CodesASCII.txt
-/city_aggregator/cities500.txtdata/
+/city_aggregator/cities500.txt
+
+# Local pipeline output, never commit (this file caused the 6 GiB history)
+data/all_jobs.json.gz
+data/*.json.gz

@@ -4,6 +4,7 @@
 
 import { escapeRegex } from './ui_utils.js';
 import { loadApplicationStatus } from './storage.js';
+import { evaluateLeadIntent } from './lead_intent_scoring.js';
 
 /**
  * Read current filter values from the DOM.
@@ -124,6 +125,9 @@ export function filterJobs(allJobs) {
             const includeTerms = f.include.split(',').map(t => t.trim()).filter(Boolean);
             if (!includeTerms.some(term => title.includes(term))) return false;
         }
+
+        const leadIntent = evaluateLeadIntent({ title, description: job.description || job.description_text || '' });
+        if (leadIntent.isExcluded) return false;
 
         return (
             (!titleRegex || titleRegex.test(title)) &&
