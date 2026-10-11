@@ -85,4 +85,4 @@ data/*.py
 /city_aggregator/*.csv
 /city_aggregator/*.py
 /city_aggregator/admin1CodesASCII.txt
-/city_aggregator/cities500.txt
+/city_aggregator/cities500.txtdata/
