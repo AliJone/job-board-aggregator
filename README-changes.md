@@ -28,6 +28,7 @@ file covers only what was added or changed on top of it.
 | Ops | Progress logging reports kept vs dropped counts | `scripts/scraper.py` |
 | Tooling | Throwaway scripts used while building description collection | `extract_ats.py`, `description_tester.py`, `test_description_collection.py` |
 | Tests | Unit tests for scoring, write safety, and the provider cap | `scripts/tests/`, `tests/` |
+| Leads | Post-scrape enrichment: top decision makers per company with email, personal emails and phone through a chain of free-tier providers | `scripts/enrich_leads.py`, `scripts/lead_providers.py` |
 | Repo | History rewritten to drop 6 GiB of committed scrape output; gitignore fixed | `.gitignore` |
 
 ## 1. Tech-title filter
@@ -185,6 +186,99 @@ was rewritten with `git filter-repo` to remove `data/` from every commit, the
 data-only snapshot commits were pruned, and the tracked inputs upstream relies
 on (company lists, salary shards, `locations.json`, `trends/daily.jsonl`) were
 re-added in a single commit. `.gitignore` now excludes `data/*.json.gz`.
+
+## 9. Lead enrichment step
+
+`scripts/enrich_leads.py` runs after the scraper and turns the scored job list
+into a contact list of decision makers. It groups `all_jobs.json` by company,
+ranks companies by best `lead_intent_score`, then total score, then job count,
+and enriches the top N (default 40 with a best score of 4 or more). For each
+company it keeps the top `--people` (default 3) decision makers: C-level and
+founders regardless of function, plus VP, head and director roles in
+engineering, technology or product.
+
+### Providers
+
+All optional. A provider is used only when its key is in `.env`, and every
+credit-spending call is counted in `scripts/output/provider_quota.json` so the
+free allowance is never exceeded across runs. A 401, 402, 403 or 429 disables
+that provider for the rest of the run.
+
+| Provider | Env key | Free tier (Oct 2026) | Used for |
+| --- | --- | --- | --- |
+| DuckDuckGo | none | unlimited, rate-limited | company site, LinkedIn results |
+| Brave Search | `BRAVE_API_KEY` | $5 credit/mo, about 1,000 queries | same, when DDG blocks |
+| Apollo | `APOLLO_API_KEY` | people search free; about 75 enrichment credits/mo | names and titles at the domain; work and personal emails |
+| Hunter | `HUNTER_API_KEY` | 50 credits/mo, verify = 0.5 | domain search with pattern, email finder, verifier |
+| Tomba | `TOMBA_API_KEY` + `TOMBA_SECRET` | 25 searches + 50 verifications/mo | domain search, email finder, verifier, phone finder |
+| ZeroBounce | `ZEROBOUNCE_API_KEY` | 100 verifications/mo | verifying guesses |
+| GitHub | `GITHUB_TOKEN` optional | 60 req/h, 5,000 with token | public profile emails |
+| OpenRouter | `OPENROUTER_API_KEY` | about 50 req/day on free models | filtering candidates, reading team pages |
+
+Snov.io, Lusha, RocketReach and Kaspr were considered and left out: none of
+them offers API access on a free plan.
+
+### Per company
+
+1. Website domain from a search, skipping job boards, social sites and data
+   brokers.
+2. Candidates from DuckDuckGo and Brave LinkedIn results, Apollo people
+   search, and Hunter or Tomba domain search when fewer than `--people`
+   decision makers were found so far. Records for the same person are merged.
+3. Published emails and phones from the company's home, contact, about, team
+   and leadership pages.
+4. One OpenRouter call to drop non-buyers and add people named with a senior
+   technical title in the site text. Emails and ids already attached by
+   providers are kept through this step.
+5. For each decision maker, the email waterfall stops at the first source at
+   or above `--min-confidence` (default 70):
+
+   | Source | Confidence |
+   | --- | --- |
+   | verified by ZeroBounce, Hunter or Tomba | 95 |
+   | exact address on the company site | 90 |
+   | GitHub public profile | 85 |
+   | Hunter or Tomba finder | provider score |
+   | Apollo enrichment, with personal emails | 80 |
+   | pattern guess, pattern confirmed or from a provider | 60 |
+   | pattern guess, inferred from site addresses | 40 |
+   | pattern guess, default `first.last` | 25 |
+
+   Anything below 95 is then verified if a verifier has quota left. A valid
+   result becomes 95, a catch-all domain becomes 55, a hard bounce moves to
+   the next pattern guess, up to three.
+6. Phone: a direct number from the provider record, else Tomba's phone finder
+   when the email is at least a confirmed-pattern guess, else the company
+   line, labelled `company line`.
+
+### Output
+
+`scripts/output/leads.csv`, one row per person, with `email_confidence`,
+`email_status` (which sources and verifiers were involved), `personal_emails`,
+`phone` and `phone_type`. `leads.json` has the same plus candidate counts and
+the detected address pattern. Progress is cached in `enrich_cache.json`;
+rerunning resumes, `--fresh` starts over. The run ends with a per-provider
+usage table against the free caps.
+
+### What free tiers can and cannot do
+
+Direct mobile numbers are not available through any free API. What arrives is
+direct lines that Hunter, Tomba or Apollo happen to carry, Tomba phone-finder
+hits, and otherwise the company switchboard. Hunter's 50 credits cover about
+15 companies of finder calls a month; after that, emails come from search,
+GitHub, Apollo and verified pattern guesses. Expect 40 to 60 decision makers
+with a credible email per month on free tiers, and a company line for every
+company. Caps can be raised with `CAP_<PROVIDER>` once credits are bought.
+
+```
+pip install ddgs
+cp .env.example .env    # fill in what you have
+python scripts/enrich_leads.py --top 40 --min-score 4 --people 3
+```
+
+Tests: `scripts/tests/test_enrich_leads.py` covers ranking, parsing, decision
+maker selection, pattern guessing, the waterfall and verification logic with
+fake providers, and the quota tracker. No network needed.
 
 ## Running a scrape
 
