@@ -1,0 +1,16 @@
+[Unit]
+Description=Job board aggregator daily run (outreach, scrape, enrich, summary email)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=__USER__
+WorkingDirectory=__REPO__
+ExecStart=__REPO__/.venv/bin/python -u scripts/daily_run.py
+# each step has its own timeout; this is only the backstop
+TimeoutStartSec=20h
+# SIGTERM reaches daily_run.py first so it can stop the step and still send the summary
+KillMode=mixed
+TimeoutStopSec=180
+Nice=10

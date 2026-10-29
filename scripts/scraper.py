@@ -1571,6 +1571,8 @@ def save_results(all_companies, active_companies, all_jobs):
         "total_companies": len(all_companies),
         "active_companies": len(active_companies),
         "total_jobs": len(all_jobs),
+        "collected_jobs": original_count,
+        "removed_jobs": cleaned_count,
         "recruiter_jobs": recruiter_jobs,
         "source_type": SOURCE_TYPE,
         "platforms": "greenhouse_api, ashby_api, bamboohr_api, lever_api, workday_api, icims_sitemap, paylocity_scrape",

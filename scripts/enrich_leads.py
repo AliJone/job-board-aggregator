@@ -19,6 +19,8 @@ Sources, all free tier:
 Usage:
     cp .env.example .env   # then fill in the keys you have; every provider is optional
     python scripts/enrich_leads.py --top 40 --min-score 4 --people 3
+    # daily server run (daily_run.py): every company, free sources only, resumable
+    python scripts/enrich_leads.py --discover-only --top 0 --cache-max-age-days 21 --max-minutes 110
 
 Outputs scripts/output/leads.json and scripts/output/leads.csv.
 """
@@ -155,7 +157,7 @@ def rank_companies(jobs, top=40, min_score=4):
         })
 
     ranked.sort(key=lambda c: (-c["max_score"], -c["total_score"], -c["job_count"], c["company"].lower()))
-    return ranked[:top]
+    return ranked[:top] if top else ranked  # top=0: every company at or above min_score
 
 
 def registered_domain(url):
@@ -578,9 +580,19 @@ def discover_people(company, domain, searchers, providers, k):
     return dedupe_people(people), pattern, pattern_source
 
 
+def split_providers(providers, discover_only):
+    """(discovery, resolution) providers. Discover-only leaves every credit for the outreach top-up;
+    Apollo's people search is free, so it stays for discovery."""
+    if not discover_only:
+        return providers, providers
+    return ({k: v for k, v in providers.items() if k not in ("hunter", "tomba")},
+            {k: v for k, v in providers.items() if k == "github"})
+
+
 def enrich_company(entry, ddg, session, providers, client, args):
     company = entry["company"]
     print(f"\n[{company}] score {entry['max_score']} | {entry['job_count']} jobs")
+    providers, resolvers = split_providers(providers, getattr(args, "discover_only", False))
 
     searchers = [("duckduckgo", lambda q: ddg_search(ddg, q, 10))]
     brave = providers.get("brave")
@@ -613,10 +625,10 @@ def enrich_company(entry, ddg, session, providers, client, args):
         pattern, pattern_source = detect_pattern([p["name"] for p in people], emails, domain)
 
     for p in leaders:
-        found = resolve_email(p, domain, company, emails, pattern, pattern_source, providers, args.min_confidence)
-        found = verify_email(found, providers)
+        found = resolve_email(p, domain, company, emails, pattern, pattern_source, resolvers, args.min_confidence)
+        found = verify_email(found, resolvers)
         p.update(found or {"email": None, "email_confidence": 0, "email_status": "not found"})
-        p["phone"], p["phone_type"] = resolve_phone(p, providers, phones)
+        p["phone"], p["phone_type"] = resolve_phone(p, resolvers, phones)
         p.pop("alternates", None)
         print(f"  {p['name']} | {p.get('title') or '?'} | {p.get('email') or '-'} [{p.get('email_confidence', 0)}]"
               f" | {p.get('phone') or '-'} ({p['phone_type']})")
@@ -629,6 +641,7 @@ def enrich_company(entry, ddg, session, providers, client, args):
         "company_emails": emails,
         "company_phones": phones,
         "email_pattern": pattern,
+        "email_pattern_source": pattern_source,
         "enriched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 
@@ -664,12 +677,17 @@ def build_providers(quota, session):
     return providers
 
 
-def load_cache():
+def load_cache(max_age_days=None, path=CACHE_FILE):
     try:
-        with open(CACHE_FILE, encoding="utf-8") as f:
-            return json.load(f)
+        with open(path, encoding="utf-8") as f:
+            cache = json.load(f)
     except (FileNotFoundError, ValueError):
         return {}
+    if not max_age_days:
+        return cache
+    # entries older than the job cycle are rediscovered so people and titles stay current
+    cutoff = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - max_age_days * 86400))
+    return {k: v for k, v in cache.items() if (v.get("enriched_at") or "") >= cutoff}
 
 
 def save_cache(cache):
@@ -719,13 +737,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", default=JOBS_FILE, help="scored job list (default: scripts/output/all_jobs.json)")
     parser.add_argument("--top", type=int, default=40,
-                        help="companies to enrich; OpenRouter free tier allows ~50 requests/day")
+                        help="companies to enrich, 0 = all; OpenRouter free tier allows ~50 requests/day")
     parser.add_argument("--min-score", type=int, default=4, help="minimum best lead_intent_score per company")
     parser.add_argument("--people", type=int, default=3, help="decision makers to resolve per company")
     parser.add_argument("--min-confidence", type=int, default=70,
                         help="stop spending provider credits once an email reaches this confidence")
     parser.add_argument("--no-llm", action="store_true", help="skip the OpenRouter cleanup pass")
     parser.add_argument("--fresh", action="store_true", help="ignore enrich_cache.json and redo every company")
+    parser.add_argument("--discover-only", action="store_true",
+                        help="free sources only: no Hunter/Tomba searches, finders, Apollo enrichment or verifiers")
+    parser.add_argument("--cache-max-age-days", type=int, default=0,
+                        help="redo cached companies older than this many days (0 = keep forever)")
+    parser.add_argument("--max-minutes", type=float, default=0,
+                        help="stop after this many minutes and write what is done; rerun resumes (0 = no limit)")
     args = parser.parse_args()
 
     if DDGS is None:
@@ -750,7 +774,9 @@ def main():
         else:
             print("OPENROUTER_API_KEY not set; running without LLM cleanup")
 
-    cache = {} if args.fresh else load_cache()
+    cache = {} if args.fresh else load_cache(args.cache_max_age_days)
+    deadline = time.time() + args.max_minutes * 60 if args.max_minutes else None
+    out_of_time = False
     results = []
     with DDGS() as ddg:
         for entry in companies:
@@ -758,6 +784,12 @@ def main():
             if key in cache:
                 print(f"\n[{entry['company']}] cached")
                 results.append(cache[key])
+                continue
+            if deadline and time.time() > deadline:
+                # keep looping so later cached companies still reach leads.json
+                if not out_of_time:
+                    print(f"\nTime budget of {args.max_minutes:g} minutes reached; rerun resumes from enrich_cache.json")
+                    out_of_time = True
                 continue
             try:
                 enriched = enrich_company(entry, ddg, session, providers, client, args)

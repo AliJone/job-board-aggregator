@@ -1,0 +1,11 @@
+[Unit]
+Description=Job board aggregator daily run at 18:00 Karachi time
+
+[Timer]
+OnCalendar=*-*-* 18:00:00 Asia/Karachi
+# a run missed while the server was down starts at boot
+Persistent=true
+Unit=jba-daily.service
+
+[Install]
+WantedBy=timers.target

@@ -1,5 +1,7 @@
+import json
 import os
 import tempfile
+import time
 import unittest
 
 from enrich_leads import (
@@ -8,12 +10,14 @@ from enrich_leads import (
     detect_pattern,
     guess_candidates,
     humanize_company,
+    load_cache,
     parse_linkedin_title,
     pick_company_domain,
     rank_companies,
     registered_domain,
     resolve_email,
     select_decision_makers,
+    split_providers,
     verify_email,
 )
 from lead_providers import QuotaTracker, normalize_verdict, template_to_pattern
@@ -150,6 +154,39 @@ class WaterfallTests(unittest.TestCase):
         result = {"email": "jane@acme.com", "email_confidence": 95, "email_status": "verified"}
         self.assertEqual(verify_email(result, {"zerobounce": verifier}), result)
         self.assertEqual(verifier.verify_calls, [])
+
+
+class DailyModeTests(unittest.TestCase):
+    def test_top_zero_returns_every_company(self):
+        jobs = [{"company": f"c{i}", "lead_intent_score": 5, "ats": "Lever", "title": "Dev", "url": f"u{i}"}
+                for i in range(50)]
+        self.assertEqual(len(rank_companies(jobs, top=0, min_score=4)), 50)
+        self.assertEqual(len(rank_companies(jobs, top=10, min_score=4)), 10)
+
+    def test_discover_only_keeps_credits_for_the_top_up(self):
+        providers = {k: FakeProvider(k) for k in ("hunter", "tomba", "apollo", "zerobounce", "brave", "github")}
+        discover, resolve = split_providers(providers, True)
+        self.assertEqual(sorted(discover), ["apollo", "brave", "github", "zerobounce"])
+        self.assertEqual(list(resolve), ["github"])
+        self.assertIs(split_providers(providers, False)[1], providers)
+
+    def test_discovery_resolution_spends_no_credits(self):
+        hunter = FakeProvider("hunter", finder={"email": "jane@acme.com", "confidence": 93, "source": "hunter"})
+        _, resolve = split_providers({"hunter": hunter}, True)
+        result = resolve_email({"name": "Jane Doe"}, "acme.com", "Acme", [], "first.last", "confirmed",
+                               resolve, min_conf=70)
+        self.assertEqual(result["email"], "jane.doe@acme.com")
+        self.assertEqual(hunter.finder_calls, 0)
+
+    def test_cache_entries_past_the_age_are_redone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "cache.json")
+            old = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 30 * 86400))
+            new = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"old": {"enriched_at": old}, "new": {"enriched_at": new}}, f)
+            self.assertEqual(sorted(load_cache(21, path=path)), ["new"])
+            self.assertEqual(sorted(load_cache(None, path=path)), ["new", "old"])
 
 
 class QuotaTrackerTests(unittest.TestCase):

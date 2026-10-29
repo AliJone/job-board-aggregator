@@ -29,6 +29,7 @@ file covers only what was added or changed on top of it.
 | Tooling | Throwaway scripts used while building description collection | `extract_ats.py`, `description_tester.py`, `test_description_collection.py` |
 | Tests | Unit tests for scoring, write safety, and the provider cap | `scripts/tests/`, `tests/` |
 | Leads | Post-scrape enrichment: top decision makers per company with email, personal emails and phone through a chain of free-tier providers | `scripts/enrich_leads.py`, `scripts/lead_providers.py` |
+| Ops | Daily server run at 18:00 Karachi time with a 3-week job cycle and an evening summary email | `scripts/daily_run.py`, `deploy/` |
 | Repo | History rewritten to drop 6 GiB of committed scrape output; gitignore fixed | `.gitignore` |
 
 ## 1. Tech-title filter
@@ -279,6 +280,80 @@ python scripts/enrich_leads.py --top 40 --min-score 4 --people 3
 Tests: `scripts/tests/test_enrich_leads.py` covers ranking, parsing, decision
 maker selection, pattern guessing, the waterfall and verification logic with
 fake providers, and the quota tracker. No network needed.
+
+## 10. Daily run on the server
+
+`scripts/daily_run.py` runs the pipeline once a day on the Oracle instance and
+emails a summary. systemd starts it at 18:00 Asia/Karachi
+(`deploy/jba-daily.timer`), which is 8 or 9 AM in New York. The full plan,
+including the outreach stages still to come, is in `docs/outreach-plan.md`.
+
+Each step is a child process with its own log and timeout. A failed step never
+stops the summary, and a crash still sends a short email with the error.
+
+| Step | What it does | When |
+| --- | --- | --- |
+| outreach | sends the day's emails from the outreach queue | once `scripts/outreach.py` exists |
+| topup | spends finder and verifier credits on the next leads in line | once `scripts/outreach.py` exists |
+| scrape | `scraper.py --source automated --max-jobs-per-provider 1500` | when the job cycle is due |
+| merge | `merge_data.py` | after a successful scrape |
+| enrich | `enrich_leads.py`, resuming from its cache | every day |
+| ingest | loads the day's leads into the outreach queue | once `scripts/outreach.py` exists |
+
+**Job cycle.** A scrape runs when the last successful one is 21 days old
+(`CYCLE_DAYS`), or sooner when the email queue has nothing left to send or
+verify, but never within 7 days of the previous one (`CYCLE_MIN_DAYS`).
+`--force-scrape` overrides it once.
+
+**Enrichment.** Until the outreach module exists, enrichment runs as before:
+the top 40 companies, spending provider credits itself. Once it exists,
+enrichment runs `--discover-only --top 0`: every company at score 4 or more,
+free sources only, at most 110 minutes a day, resuming the next evening from
+its cache. Credits are then spent by the outreach top-up, just ahead of
+sending.
+
+**Summary email.** Steps and timings, the job cycle, the scrape per ATS, the
+shortlist, enrichment results, people ready to email, free-tier usage and
+warnings, with the day's leads CSV attached. SMTP settings and the recipient
+live in `.env` (`SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`,
+`SMTP_FROM`, `SUMMARY_TO`); all other settings are listed in `.env.example`.
+
+**Files**, all under the gitignored `scripts/output/`:
+
+- `runs/YYYY-MM-DD.json`: the run record (steps, cycle, summary, email status)
+- `runs/YYYY-MM-DD.summary.txt`: the summary as text, written even without SMTP
+- `runs/YYYY-MM-DD.leads.json` and `.leads.csv`: the day's leads
+- `logs/daily-YYYY-MM-DD.log` and one `logs/daily-YYYY-MM-DD.<step>.log` per step
+
+Runs and logs older than 90 days are deleted.
+
+Install on the server (Ubuntu, Python 3.11 or newer), as the normal user:
+
+```
+git pull
+bash deploy/install.sh
+nano .env                                   # SMTP_* and SUMMARY_TO
+.venv/bin/python scripts/daily_run.py --test-email
+sudo systemctl start jba-daily.service      # first run now; the timer takes over after
+journalctl -u jba-daily -f
+```
+
+Other commands:
+
+```
+python scripts/daily_run.py --skip scrape,merge --no-email --print   # quick run on existing data
+python scripts/daily_run.py --resend --date 2026-10-28               # mail a stored summary again
+systemctl list-timers jba-daily.timer                                # next run time
+```
+
+Smaller changes that came with it: `scraper.py` writes `collected_jobs` and
+`removed_jobs` to `metadata.json`. `enrich_leads.py` gained `--top 0` for every
+company, `--discover-only`, `--cache-max-age-days` and `--max-minutes`, and
+records `email_pattern_source` per company.
+
+Tests: `scripts/tests/test_daily_run.py` covers the cycle rule, summary
+numbers, run records, email building, config parsing and the step runner, and
+`test_enrich_leads.py` gained cases for the new flags. No network needed.
 
 ## Running a scrape
 
