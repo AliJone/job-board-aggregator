@@ -192,6 +192,71 @@
             </div>
         </div>
 
+        <!-- Live Scrape (shown only when served by server.py) -->
+        <div id="live-scrape" class="card p-3 mb-3 d-none">
+            <div class="row g-3">
+                <div class="col-lg-5">
+                    <div class="d-flex flex-wrap gap-2">
+                        <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse"
+                            data-bs-target="#live-companies-section" aria-expanded="false"
+                            aria-controls="live-companies-section">
+                            Companies (advanced)
+                        </button>
+                        <button class="btn btn-sm btn-outline-secondary" type="button" data-bs-toggle="collapse"
+                            data-bs-target="#my-list-section" aria-expanded="false" aria-controls="my-list-section">
+                            ★ My list · <span id="my-list-count">0</span>
+                        </button>
+                    </div>
+                    <div id="my-list-section" class="collapse mt-2">
+                        <div class="d-flex flex-wrap align-items-center gap-3 mb-1">
+                            <button type="button" id="my-list-add" class="btn btn-link btn-sm p-0">Add ticked companies</button>
+                            <div class="form-check mb-0 ms-auto">
+                                <input class="form-check-input" type="checkbox" id="live-auto-add" checked>
+                                <label class="form-check-label small" for="live-auto-add">Auto-add companies with matching jobs</label>
+                            </div>
+                        </div>
+                        <div id="my-list-rows" class="live-picker my-list-rows"></div>
+                    </div>
+                    <div id="live-companies-section" class="collapse mt-2">
+                        <input type="search" id="live-company-search" class="form-control form-control-sm"
+                            placeholder="Search companies, e.g. stripe" aria-label="Search companies">
+                        <div class="d-flex align-items-center gap-3 my-1">
+                            <button type="button" id="live-select-all" class="btn btn-link btn-sm p-0">Select all tech</button>
+                            <button type="button" id="live-select-none" class="btn btn-link btn-sm p-0">Clear</button>
+                            <small id="live-picked-count" class="text-muted ms-auto"></small>
+                        </div>
+                        <div id="live-company-picker" class="live-picker"></div>
+                        <label for="live-companies" class="form-label fw-semibold mt-2">Companies to scrape</label>
+                        <textarea id="live-companies" class="form-control font-monospace" rows="4"></textarea>
+                    </div>
+                    <div class="d-flex flex-wrap align-items-center gap-2 mt-2">
+                        <div class="dropdown">
+                            <button type="button" id="live-role-button" class="btn btn-sm btn-outline-secondary dropdown-toggle"
+                                data-bs-toggle="dropdown" data-bs-auto-close="outside" aria-expanded="false">
+                                Role: any
+                            </button>
+                            <div id="live-roles" class="dropdown-menu px-3 py-2"></div>
+                        </div>
+                        <div id="live-filters"></div>
+                    </div>
+                    <div class="d-flex flex-wrap align-items-center gap-2 mt-2">
+                        <button type="button" id="live-run" class="btn btn-primary">Run scrape</button>
+                        <label class="d-flex align-items-center gap-1 small text-nowrap mb-0" for="live-discover">
+                            Try
+                            <input type="number" id="live-discover" class="form-control form-control-sm live-discover"
+                                min="0" max="200" step="1" value="20">
+                            new companies
+                        </label>
+                        <small id="live-status" class="text-muted"></small>
+                    </div>
+                </div>
+                <div class="col-lg-7">
+                    <label for="live-log" class="form-label fw-semibold">Scraper log</label>
+                    <div id="live-log" class="live-log" role="log" aria-live="polite"></div>
+                </div>
+            </div>
+        </div>
+
         <!-- Loading State -->
         <div id="loading" class="text-center py-5">
             <div class="spinner-border text-primary" role="status">

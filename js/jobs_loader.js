@@ -89,6 +89,33 @@ export async function loadJobsProgressive(app, basePath = 'https://feashliaa.git
 }
 
 /**
+ * Load jobs from the local API server (server.py). Returns the response body,
+ * or null when the page is served without the API (static hosting).
+ * @param {Object} app - JobBoardApp instance
+ * @returns {Promise<Object|null>}
+ */
+export async function loadJobsFromApi(app) {
+    let data;
+    try {
+        const res = await fetch('/api/jobs');
+        if (!res.ok) return null;
+        data = await res.json();
+    } catch {
+        return null;
+    }
+
+    app.allJobs = data.jobs;
+    app.filteredJobs = [...data.jobs];
+    app.isFullyLoaded = !data.running;
+    updateStats(app.allJobs, data.last_updated);
+    if (app.isFullyLoaded) {
+        document.querySelector('.job-table thead')?.classList.remove('sorting-locked');
+        enableMap();
+    }
+    return data;
+}
+
+/**
  * Update the stats bar in the DOM.
  * @param {Array} jobs - The full jobs array
  * @param {string} [lastUpdated] - ISO timestamp from manifest

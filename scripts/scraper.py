@@ -232,6 +232,7 @@ def fetch_company_jobs_greenhouse(slug):
                             ],
                             "id": job.get("id"),
                             "updated_at": job.get("updated_at"),
+                            "posted_at": job.get("first_published"),
                             "is_recruiter": is_recruiter_company(slug),
                             "ats": "Greenhouse",
                             "skill_level": job_tier_classification(title),
@@ -472,6 +473,7 @@ def fetch_company_jobs_lever(slug):
                             "remote": remote,
                             "coords": coords,
                             "url": job.get("hostedUrl"),
+                            "posted_at": _lever_posted_at(job.get("createdAt")),
                             "is_recruiter": is_recruiter_company(slug),
                             "ats": "Lever",
                             "skill_level": job_tier_classification(title),
@@ -483,6 +485,13 @@ def fetch_company_jobs_lever(slug):
     except Exception as e:
         print(f"Error fetching Lever for {slug}: {e}")
     return slug, [], None, 0
+
+
+def _lever_posted_at(created_ms):
+    """Lever createdAt is epoch milliseconds; return ISO 8601 UTC or None."""
+    if not isinstance(created_ms, (int, float)):
+        return None
+    return datetime.fromtimestamp(created_ms / 1000, timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _parse_workday_posted_on(text):
@@ -1519,6 +1528,7 @@ def save_results(all_companies, active_companies, all_jobs):
         "coords",
         "salary",
         "updated_at",
+        "posted_at",
         "first_seen",
         "lead_intent_score",
     }

@@ -5,7 +5,8 @@
 import { showToast, showLoadingToast, setUIBusy, updateFABVisibility, updateSortIndicators } from './ui_utils.js';
 import { saveApplicationStatus } from './storage.js';
 import { createColumns } from './columns.js';
-import { loadJobsProgressive, updateStats } from './jobs_loader.js';
+import { loadJobsProgressive, loadJobsFromApi, updateStats } from './jobs_loader.js';
+import { setupLiveScrape } from './live_scrape.js';
 import { filterJobs, clearFilterInputs } from './filters.js';
 import { render } from './renderer.js';
 import { updateURL, loadFromURL } from './url_state.js';
@@ -50,7 +51,12 @@ class JobBoardApp {
         const resultsEl = document.getElementById('results');
 
         try {
-            await loadJobsProgressive(this);
+            const apiData = await loadJobsFromApi(this);
+            if (apiData) {
+                setupLiveScrape(this, apiData);
+            } else {
+                await loadJobsProgressive(this);
+            }
             this.sortState = { key: null, direction: 'asc' };
 
             loadingEl.style.display = 'none';

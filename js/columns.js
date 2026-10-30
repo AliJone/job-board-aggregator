@@ -58,7 +58,7 @@ export function createColumns() {
             label: 'Posted',
             sortable: true,
             render: job => {
-                const raw = job.updated_at || job.first_seen;
+                const raw = job.posted_at || job.updated_at || job.first_seen;
                 if (!raw) return '<span class="text-muted">—</span>';
                 const d = new Date(raw);
                 if (isNaN(d.getTime())) return '<span class="text-muted">—</span>';

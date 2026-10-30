@@ -107,7 +107,7 @@ export function filterJobs(allJobs) {
         // Date posted (within N days)
         if (f.posted) {
             const days = parseInt(f.posted, 10);
-            const raw = job.updated_at || job.first_seen;
+            const raw = job.posted_at || job.updated_at || job.first_seen;
             const t = raw ? Date.parse(raw) : NaN;
             if (isNaN(t)) return false;   // no date = excluded when a date filter is active
             const ageDays = (Date.now() - t) / 86400000;
