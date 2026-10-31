@@ -4,20 +4,22 @@ Free-tier data providers for enrich_leads.py.
 
 Every provider is optional: it is built only when its API key is present, and
 it stops calling out once the free quota for the period is spent (tracked in
-scripts/output/provider_quota.json) or the API answers 401/402/403/429.
+scripts/output/provider_quota.json) or the API answers 401/402/403. A 429 is
+retried with exponential backoff and stops the provider only if it persists.
 
 Free tiers as of 2026-10 (check each vendor's pricing page before relying on them):
   Hunter      50 shared credits/month (find = 1, verify = 0.5), API included
-  Tomba       25 search credits + 50 verifications/month, 1 req/s, API included
+  Tomba       25 search credits + 50 verifications/month; 1 req/s, 2/min, 5/day per endpoint
   Apollo      people search = 0 credits; enrichment ~75 credits/month, needs a work-email account
   ZeroBounce  100 verifications/month, business domain required
   GitHub      no key needed; 10 searches/min, 60 requests/hour unauthenticated
   Brave       $5 credit/month (about 1,000 searches), card on file
-  OpenRouter  ~50 requests/day on :free models without purchased credits
+  OpenRouter  50 requests/day on :free models, 1,000 after a lifetime $10 credit purchase
 """
 
 import json
 import os
+import random
 import re
 import time
 
@@ -39,12 +41,12 @@ DEFAULT_CAPS = {
 
 OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
-# Tried in order, but only if OpenRouter's live catalog still lists them as free.
+# Built-in chain, best first; the live catalog drops any that are no longer free.
+# OPENROUTER_MODEL (comma list, best first) replaces it.
 PREFERRED_FREE_MODELS = [
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "openai/gpt-oss-120b:free",
     "google/gemma-4-31b-it:free",
     "nvidia/nemotron-3-ultra-550b-a55b:free",
+    "google/gemma-4-26b-a4b-it:free",
 ]
 
 STOPWORDS = {"the", "inc", "llc", "ltd", "corp", "corporation", "company", "group",
@@ -94,6 +96,20 @@ def _full_name(first, last, fallback=""):
     return (name or fallback or "").strip()
 
 
+def retry_after_seconds(resp):
+    try:
+        return float(resp.headers.get("Retry-After"))
+    except (TypeError, ValueError):
+        return None  # missing, or an HTTP date
+
+
+def backoff_delay(attempt, base=2.0, cap=90.0, retry_after=None):
+    """Seconds before retry attempt+1: the server's Retry-After when given, else base * 2**attempt with jitter."""
+    if retry_after is not None:
+        return min(retry_after, cap)
+    return min(cap, base * 2 ** attempt * random.uniform(0.8, 1.2))
+
+
 class QuotaTracker:
     """Counts credit-spending calls per bucket per period so free tiers are never exceeded."""
 
@@ -141,6 +157,8 @@ class Provider:
     name = "base"
     verify_cost = 1
     verify_bucket = None
+    MAX_429_RETRIES = 5  # waits about 2, 4, 8, 16, 32 s
+    MAX_429_WAIT_S = 90  # a longer Retry-After is a daily or monthly limit; waiting will not help this run
 
     def __init__(self, quota, session=None):
         self.quota = quota
@@ -159,17 +177,27 @@ class Provider:
 
     def _request(self, method, url, **kwargs):
         kwargs.setdefault("timeout", 20)
-        try:
-            resp = self.session.request(method, url, **kwargs)
-        except requests.RequestException as exc:
-            print(f"    {self.name}: {exc.__class__.__name__}")
-            return None
+        for attempt in range(self.MAX_429_RETRIES + 1):
+            try:
+                resp = self.session.request(method, url, **kwargs)
+            except requests.RequestException as exc:
+                print(f"    {self.name}: {exc.__class__.__name__}")
+                return None
+            retry_after = retry_after_seconds(resp)
+            if resp.status_code != 429 or attempt == self.MAX_429_RETRIES or (retry_after or 0) > self.MAX_429_WAIT_S:
+                break
+            wait = backoff_delay(attempt, retry_after=retry_after)
+            print(f"    {self.name}: rate limited, retrying in {wait:.0f}s")
+            time.sleep(wait)
         if resp.status_code == 404:
             return {}
         if resp.status_code == 429:
-            self.disabled_reason = "rate limited"
+            long_wait = (retry_after or 0) > self.MAX_429_WAIT_S
+            self.disabled_reason = f"rate limited, resets in {retry_after / 3600:.1f}h" if long_wait else "rate limited"
         elif resp.status_code in (401, 403):
-            self.disabled_reason = f"HTTP {resp.status_code}, check the API key"
+            # GitHub reports its hourly limit as a 403
+            self.disabled_reason = ("rate limited (hourly allowance used)" if resp.headers.get("X-RateLimit-Remaining") == "0"
+                                    else f"HTTP {resp.status_code}, check the API key")
         elif resp.status_code == 402:
             self.disabled_reason = "out of credits"
         if self.disabled_reason:
@@ -454,14 +482,22 @@ class BraveSearch(Provider):
 
 
 class OpenRouterClient(Provider):
+    """Free models in a best-first chain. A model that is busy or answers empty rests, twice as long each
+    time it fails again; every call starts at the best model that is not resting."""
     name = "openrouter"
+    COOLDOWN_S = 30  # first rest; doubles per consecutive failure
+    MAX_COOLDOWN_S = 900
+    MAX_WAIT_S = 120  # longest a call waits when every model is resting
 
     def __init__(self, api_key, quota, model=None, session=None):
         super().__init__(quota, session)
         self.key = api_key
-        self.model = model or self._pick_free_model()
+        self.models = [m.strip() for m in (model or "").split(",") if m.strip()] or self._pick_free_models()
+        self.model = self.models[0]  # last model that answered
+        self.resting_until = {}
+        self.strikes = {}
 
-    def _pick_free_model(self):
+    def _pick_free_models(self):
         try:
             resp = requests.get(OPENROUTER_MODELS_URL, timeout=20)
             resp.raise_for_status()
@@ -472,39 +508,64 @@ class OpenRouterClient(Provider):
                 and float((m.get("pricing") or {}).get("completion") or 0) == 0
             }
         except (requests.RequestException, ValueError, KeyError):
-            free = set()
-        for candidate in PREFERRED_FREE_MODELS:
-            if candidate in free:
-                return candidate
-        return sorted(free)[0] if free else PREFERRED_FREE_MODELS[0]
+            return list(PREFERRED_FREE_MODELS)
+        return [m for m in PREFERRED_FREE_MODELS if m in free] or sorted(free)[:3] or PREFERRED_FREE_MODELS[:1]
 
-    def chat(self, system, user, retries=3):
+    def chat(self, system, user):
         if not self.available(1):
             return None
-        payload = {"model": self.model, "temperature": 0,
-                   "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+        for _ in range(2):  # the second pass runs only after waiting for the first model to come back
+            for model in self.models:
+                if self.resting_until.get(model, 0) > time.monotonic():
+                    continue
+                content = self._ask(model, messages)
+                if content or self.disabled_reason:
+                    return content
+            wait = min(self.resting_until.get(m, 0) for m in self.models) - time.monotonic()
+            if wait > self.MAX_WAIT_S:
+                break
+            if wait > 0:
+                print(f"    openrouter: every model is resting, waiting {wait:.0f}s")
+                time.sleep(wait)
+        return None
+
+    def _ask(self, model, messages):
         headers = {"Authorization": f"Bearer {self.key}", "Content-Type": "application/json",
                    "HTTP-Referer": "https://github.com/AliJone/job-board-aggregator",
                    "X-Title": "job-board-aggregator lead enrichment"}
-        for attempt in range(retries + 1):
-            try:
-                resp = self.session.post(OPENROUTER_CHAT_URL, json=payload, headers=headers, timeout=90)
-            except requests.RequestException as exc:
-                print(f"    openrouter: {exc.__class__.__name__}")
-                time.sleep(10)
-                continue
-            if resp.status_code == 429:
-                wait = int(resp.headers.get("Retry-After") or 20 * (attempt + 1))
-                print(f"    openrouter: rate limited, waiting {wait}s")
-                time.sleep(wait)
-                continue
-            if resp.status_code != 200:
-                print(f"    openrouter: HTTP {resp.status_code} {resp.text[:160]}")
-                return None
-            self.calls += 1
-            self.quota.spend(self.name, 1)
-            try:
-                return resp.json()["choices"][0]["message"]["content"]
-            except (KeyError, IndexError, ValueError):
-                return None
+        try:
+            resp = self.session.post(OPENROUTER_CHAT_URL, json={"model": model, "temperature": 0, "messages": messages},
+                                     headers=headers, timeout=90)
+        except requests.RequestException as exc:
+            return self._rest(model, exc.__class__.__name__)
+        if resp.status_code in (401, 402, 403):
+            self.disabled_reason = f"HTTP {resp.status_code}, check the key and credits"
+        elif resp.status_code == 429 and "free-models-per-day" in resp.text:
+            self.disabled_reason = "daily free-model limit reached"
+        if self.disabled_reason:
+            print(f"    openrouter: {self.disabled_reason}, skipping for the rest of this run")
+            return None
+        if resp.status_code == 404:
+            return self._rest(model, "is no longer available", forever=True)
+        if resp.status_code != 200:
+            return self._rest(model, f"HTTP {resp.status_code} {resp.text[:80]}", retry_after_seconds(resp))
+        self.calls += 1
+        self.quota.spend(self.name, 1)
+        try:
+            content = resp.json()["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError, ValueError):
+            content = None
+        if not (content or "").strip():
+            return self._rest(model, "gave an empty answer")
+        self.model = model
+        self.strikes.pop(model, None)
+        return content
+
+    def _rest(self, model, why, retry_after=None, forever=False):
+        self.strikes[model] = self.strikes.get(model, 0) + 1
+        seconds = (float("inf") if forever else
+                   backoff_delay(self.strikes[model] - 1, self.COOLDOWN_S, self.MAX_COOLDOWN_S, retry_after))
+        self.resting_until[model] = time.monotonic() + seconds
+        print(f"    openrouter: {model} {why}; " + ("dropped for this run" if forever else f"resting {seconds:.0f}s"))
         return None

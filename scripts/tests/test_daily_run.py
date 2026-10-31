@@ -200,16 +200,21 @@ class EmailTests(unittest.TestCase):
     def test_subject_counts(self):
         self.assertEqual(build_subject(summary(), RECORD), "[JBA] 2026-10-29: 2 ready, 2 shortlisted, 1 warning")
 
-    def test_paused_inbox_and_replies_are_loud(self):
-        outreach = {"mode": "send", "sent_first": 3, "sent_followup": 2,
-                    "replies": [{"name": "Jane Doe", "company": "Acme", "snippet": "Yes, send the profiles"}],
-                    "paused_inboxes": [{"address": "ali@example.com", "reason": "bounce_rate 8.6% (3/35)"}],
+    def test_paused_inbox_stops_and_followups_are_loud(self):
+        jane = {"email": "jane@acme.com", "name": "Jane Doe", "company": "Acme", "reason": "replied"}
+        outreach = {"mode": "send", "sent_first": 3, "sent_followup": 2, "replies": [jane], "stopped_today": [jane],
+                    "followups_next": [{"name": "Bo Kim", "company": "Beta", "email": "bo@beta.io",
+                                        "first_sent": "2026-10-22", "due": "2026-10-29"}],
+                    "paused_inboxes": [{"address": "ali@example.com", "reason": "3 bounces reported in 7 days"}],
                     "periods": {"today": {"first_sent": 3, "reply_rate": 0.333}, "ytd": {"first_sent": 120}}}
         result = summary(outreach=outreach)
-        self.assertTrue(build_subject(result, RECORD).startswith("PAUSED [JBA] 2026-10-29: 5 sent, 1 reply"))
+        self.assertTrue(build_subject(result, RECORD).startswith(
+            "PAUSED [JBA] 2026-10-29: 5 sent, 1 reply, 1 follow-up next"))
         text = render_text(summary_blocks(result, RECORD))
         self.assertIn("PAUSED: ali@example.com", text)
-        self.assertIn("Yes, send the profiles", text)
+        self.assertIn("jane@acme.com", text)
+        self.assertIn("bo@beta.io", text)
+        self.assertIn("outreach.py stop EMAIL", text)
         self.assertIn("33.3%", text)
 
     def test_send_email_never_raises(self):

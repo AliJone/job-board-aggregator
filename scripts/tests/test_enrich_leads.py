@@ -3,9 +3,12 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from enrich_leads import (
     CONFIDENCE,
+    DDG_THROTTLED,
+    ddg_search,
     dedupe_people,
     detect_pattern,
     guess_candidates,
@@ -20,7 +23,7 @@ from enrich_leads import (
     split_providers,
     verify_email,
 )
-from lead_providers import QuotaTracker, normalize_verdict, template_to_pattern
+from lead_providers import OpenRouterClient, Provider, QuotaTracker, normalize_verdict, template_to_pattern
 
 
 class FakeProvider:
@@ -201,6 +204,187 @@ class QuotaTrackerTests(unittest.TestCase):
             self.assertTrue(quota.allow("demo", 0.5))
             reloaded = QuotaTracker(os.path.join(tmp, "quota.json"), caps={"demo": (2, "month")})
             self.assertEqual(reloaded.used("demo"), 1.5)
+
+
+class FakeClock:
+    def __init__(self):
+        self.now, self.slept = 1000.0, []
+
+    def __getattr__(self, name):
+        return getattr(time, name)  # strftime and the rest stay real; only the clock is faked
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+class FakeResponse:
+    def __init__(self, status=200, body=None, text="", headers=None):
+        self.status_code, self.body, self.headers = status, body, headers or {}
+        self.text = text or json.dumps(body or {})
+
+    def json(self):
+        if self.body is None:
+            raise ValueError("no body")
+        return self.body
+
+
+def answer(content):
+    return FakeResponse(200, {"choices": [{"message": {"content": content}}]})
+
+
+BUSY = FakeResponse(429, text='{"error":{"message":"Provider returned error"}}')
+
+
+class FakeSession:
+    """Replays scripted responses, per model for OpenRouter, in order otherwise; the last one repeats."""
+
+    def __init__(self, replies):
+        self.replies, self.calls = replies, []
+
+    @staticmethod
+    def _next(script):
+        return script.pop(0) if len(script) > 1 else script[0]
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        self.calls.append(json["model"])
+        return self._next(self.replies[json["model"]])
+
+    def request(self, method, url, **kwargs):
+        self.calls.append(url)
+        return self._next(self.replies)
+
+
+class FakeDDG:
+    def __init__(self, outcomes):
+        self.outcomes, self.calls = outcomes, 0
+
+    def text(self, query, max_results=10):
+        self.calls += 1
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+
+class ClockTestCase(unittest.TestCase):
+    clock_target = "lead_providers.time"
+
+    def setUp(self):
+        self.clock = FakeClock()
+        patcher = mock.patch(self.clock_target, self.clock)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class OpenRouterChainTests(ClockTestCase):
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.quota = QuotaTracker(os.path.join(tmp.name, "quota.json"), caps={"openrouter": (50, "day")})
+
+    def client(self, replies):
+        session = FakeSession(replies)
+        return OpenRouterClient("key", self.quota, ",".join(replies), session), session
+
+    def test_env_list_keeps_order_without_a_catalog_call(self):
+        with mock.patch("lead_providers.requests.get", side_effect=AssertionError("catalog fetched")):
+            client = OpenRouterClient("key", self.quota, " best, mid ,worst ", FakeSession({}))
+        self.assertEqual(client.models, ["best", "mid", "worst"])
+        self.assertEqual(client.model, "best")
+
+    def test_busy_model_falls_through_and_best_returns_after_its_rest(self):
+        client, session = self.client({"best": [BUSY, answer("from best")], "mid": [answer("from mid")]})
+        self.assertEqual(client.chat("s", "u"), "from mid")
+        self.assertEqual(client.chat("s", "u"), "from mid")  # best still resting
+        self.clock.now += 60
+        self.assertEqual(client.chat("s", "u"), "from best")
+        self.assertEqual(session.calls, ["best", "mid", "mid", "best"])
+        self.assertEqual(self.quota.used("openrouter"), 3)
+
+    def test_repeated_failures_double_the_rest(self):
+        client, session = self.client({"best": [BUSY], "mid": [answer("mid")]})
+        client.chat("s", "u")  # best rests about 30 s
+        self.clock.now += 40
+        client.chat("s", "u")  # fails again, rests about 60 s
+        self.clock.now += 40
+        client.chat("s", "u")
+        self.assertEqual(session.calls, ["best", "mid", "best", "mid", "mid"])
+
+    def test_retired_model_sits_out_the_run_and_empty_answers_rest(self):
+        client, session = self.client({"best": [FakeResponse(404, text="no endpoints")], "mid": [answer("")],
+                                       "worst": [answer("from worst")]})
+        self.assertEqual(client.chat("s", "u"), "from worst")
+        self.clock.now += 3600
+        self.assertEqual(client.chat("s", "u"), "from worst")
+        self.assertEqual(session.calls, ["best", "mid", "worst", "mid", "worst"])
+
+    def test_daily_account_limit_stops_every_model(self):
+        limit = FakeResponse(429, text='{"error":{"message":"Rate limit exceeded: free-models-per-day"}}')
+        client, session = self.client({"best": [limit], "mid": [answer("mid")]})
+        self.assertIsNone(client.chat("s", "u"))
+        self.assertIsNone(client.chat("s", "u"))
+        self.assertEqual(session.calls, ["best"])
+        self.assertIn("daily", client.disabled_reason)
+
+    def test_waits_for_the_first_model_back_when_all_are_resting(self):
+        client, session = self.client({"best": [BUSY, answer("after the wait")]})
+        self.assertEqual(client.chat("s", "u"), "after the wait")
+        self.assertEqual(session.calls, ["best", "best"])
+        self.assertTrue(24 <= sum(self.clock.slept) <= 36)
+
+
+class RateLimitBackoffTests(ClockTestCase):
+    def test_429_backs_off_exponentially_then_succeeds(self):
+        p = Provider(None, FakeSession([FakeResponse(429), FakeResponse(429), FakeResponse(200, {"ok": True})]))
+        self.assertEqual(p._get("https://api.example.com"), {"ok": True})
+        self.assertIsNone(p.disabled_reason)
+        self.assertEqual(len(self.clock.slept), 2)
+        self.assertTrue(1.6 <= self.clock.slept[0] <= 2.4 and 3.2 <= self.clock.slept[1] <= 4.8)
+
+    def test_short_retry_after_is_honoured(self):
+        p = Provider(None, FakeSession([FakeResponse(429, headers={"Retry-After": "42"}), FakeResponse(200, {"ok": True})]))
+        self.assertEqual(p._get("https://api.example.com"), {"ok": True})
+        self.assertEqual(self.clock.slept, [42.0])
+
+    def test_daily_limit_disables_without_waiting(self):
+        p = Provider(None, FakeSession([FakeResponse(429, headers={"Retry-After": "26981"})]))
+        self.assertIsNone(p._get("https://api.example.com"))
+        self.assertEqual(self.clock.slept, [])
+        self.assertEqual(p.disabled_reason, "rate limited, resets in 7.5h")
+
+    def test_persistent_429_disables_after_five_retries(self):
+        session = FakeSession([FakeResponse(429)])
+        p = Provider(None, session)
+        self.assertIsNone(p._get("https://api.example.com"))
+        self.assertEqual(len(session.calls), 6)
+        self.assertEqual(p.disabled_reason, "rate limited")
+
+    def test_github_hourly_limit_is_not_reported_as_a_bad_key(self):
+        p = Provider(None, FakeSession([FakeResponse(403, headers={"X-RateLimit-Remaining": "0"})]))
+        p._get("https://api.github.com/search/users")
+        self.assertEqual(p.disabled_reason, "rate limited (hourly allowance used)")
+
+
+class DuckDuckGoBackoffTests(ClockTestCase):
+    clock_target = "enrich_leads.time"
+
+    def test_empty_page_is_retried_once(self):
+        ddg = FakeDDG([Exception("No results found."), Exception("No results found.")])
+        self.assertEqual(ddg_search(ddg, "q"), [])
+        self.assertEqual(ddg.calls, 2)
+        self.assertEqual(len(self.clock.slept), 1)
+
+    @unittest.skipUnless(DDG_THROTTLED, "ddgs not installed")
+    def test_rate_limit_backs_off_exponentially(self):
+        throttled = DDG_THROTTLED[0]("ratelimit")
+        ddg = FakeDDG([throttled, throttled, [{"href": "https://acme.com"}]])
+        self.assertEqual(ddg_search(ddg, "q"), [{"href": "https://acme.com"}])
+        self.assertTrue(12 <= self.clock.slept[0] <= 18 and 24 <= self.clock.slept[1] <= 36)
 
 
 if __name__ == "__main__":

@@ -251,14 +251,9 @@ def fetch_company_jobs_greenhouse(slug):
 def fetch_company_jobs_ashby(slug):
     dropped_count = 0
     try:
-        url = "https://jobs.ashbyhq.com/api/non-user-graphql?op=ApiJobBoardWithTeams"
-        payload = {
-            "operationName": "ApiJobBoardWithTeams",
-            "variables": {"organizationHostedJobsPageName": slug},
-            "query": "query ApiJobBoardWithTeams($organizationHostedJobsPageName: String!) { jobBoard: jobBoardWithTeams(organizationHostedJobsPageName: $organizationHostedJobsPageName) { jobPostings { id title locationName descriptionPlain } } }",
-        }
+        # Public posting API: the GraphQL board query rejects descriptionPlain and returns no jobs.
+        url = f"https://api.ashbyhq.com/posting-api/job-board/{slug}"
         headers = {
-            "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": random.choice(USER_AGENTS),
         }
@@ -267,7 +262,7 @@ def fetch_company_jobs_ashby(slug):
 
         max_retries = 2
         for attempt in range(max_retries + 1):
-            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            response = requests.get(url, headers=headers, timeout=30)
 
             if response.status_code == 200:
                 break
@@ -286,13 +281,12 @@ def fetch_company_jobs_ashby(slug):
             return slug, [], response.status_code, 0
 
         data = response.json()
-        jobs = (data.get("data") or {}).get("jobBoard") or {}
-        jobs = jobs.get("jobPostings") or []
+        jobs = [j for j in data.get("jobs") or [] if j.get("isListed", True)]
 
         if jobs:
             normalized = []
             for job in jobs:
-                title = job.get("title", "")
+                title = (job.get("title") or "").strip()
                 
                 if not is_tech_role(title):
                     dropped_count += 1
@@ -306,8 +300,8 @@ def fetch_company_jobs_ashby(slug):
                         "company_slug": slug,
                         "title": title,
                         "description": description,
-                        "location": job.get("locationName", "Not specified")[:50],
-                        "url": f"https://jobs.ashbyhq.com/{slug}/{job.get('id')}",
+                        "location": (job.get("location") or "Not specified")[:50],
+                        "url": job.get("jobUrl") or f"https://jobs.ashbyhq.com/{slug}/{job.get('id')}",
                         "is_recruiter": is_recruiter_company(slug),
                         "ats": "Ashby",
                         "skill_level": job_tier_classification(title),
@@ -924,6 +918,8 @@ def fetch_all_jobs(companies, fetcher, platform="ATS", max_jobs_per_provider=Non
                 if max_jobs_per_provider is not None:
                     remaining_budget = max_jobs_per_provider - len(all_jobs)
                     if remaining_budget <= 0:
+                        # Without this, leaving the with-block still waits for every queued board.
+                        executor.shutdown(wait=False, cancel_futures=True)
                         break
                 if max_jobs_per_provider is not None and jobs:
                     jobs = jobs[:remaining_budget]

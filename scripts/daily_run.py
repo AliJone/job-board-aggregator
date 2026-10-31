@@ -618,33 +618,37 @@ def summary_blocks(summary, record):
         line = (f"Mode {outreach.get('mode', '?')}. Sent today: {_num(outreach.get('sent_first', 0))} first touches "
                 f"and {_num(outreach.get('sent_followup', 0))} follow-ups.")
         if outreach.get("drafts_written"):
-            line += (f" {_num(outreach['drafts_written'])} drafts are waiting for review in "
+            drafts = outreach["drafts_written"]
+            line += (f" {_plural(drafts, 'draft')} {'is' if drafts == 1 else 'are'} waiting for review in "
                      f"scripts/output/drafts/{record.get('run_date')}/.")
         add(("p", line))
         if outreach.get("sent"):
             add(("table", ["Name", "Company", "Kind", "Subject"],
                  [[m.get("name"), m.get("company"), m.get("kind"), m.get("subject")] for m in outreach["sent"]]))
-        replies = outreach.get("replies") or []
-        add(("p", f"Replies received: {len(replies)}."))
-        if replies:
-            add(("table", ["Name", "Company", "Title", "Received", "What they wrote"],
-                 [[r.get("name"), r.get("company"), r.get("title"), r.get("at"), r.get("snippet")] for r in replies]))
-        mine = outreach.get("owner_replies") or []
-        if mine:
-            add(("p", "You replied from your inbox to:"))
-            add(("table", ["Name", "Company", "When"], [[r.get("name"), r.get("company"), r.get("at")] for r in mine]))
-        add(("p", f"Bounces {_num(outreach.get('bounces', 0))}, unsubscribes {_num(outreach.get('unsubscribes', 0))}, "
-                  f"out of office {_num(outreach.get('ooo', 0))}, complaints {_num(outreach.get('complaints', 0))}."))
+        stopped = outreach.get("stopped_today") or []
+        if stopped:
+            add(("p", f"Stopped by you since the last run: {len(stopped)}."))
+            add(("table", ["Email", "Name", "Company", "Reason"],
+                 [[s.get("email"), s.get("name"), s.get("company"), s.get("reason")] for s in stopped]))
+        due = outreach.get("followups_next") or []
+        if due:
+            # Zoho Free has no IMAP, so a reply is only known when you report it
+            add(("p", f"Follow-ups due at the next run: {len(due)}. If any of these people replied, unsubscribed "
+                      "or bounced, stop them first: .venv/bin/python scripts/outreach.py stop EMAIL --reason replied"))
+            add(("table", ["Name", "Company", "Email", "First email", "Due"],
+                 [[f.get("name"), f.get("company"), f.get("email"), f.get("first_sent"), f.get("due")] for f in due]))
+        if outreach.get("weekend"):
+            add(("p", "Nothing was sent today: it is the weekend where the recipients are."))
         if outreach.get("inboxes"):
-            add(("table", ["Inbox", "Status", "Warm-up day", "Cap today", "Used today", "Bounce rate 7d"],
+            add(("table", ["Inbox", "Status", "Warm-up day", "Cap today", "Used today", "Reported bounce rate 7d"],
                  [[i.get("address"), i.get("status"), i.get("warmup_day"), i.get("cap_today"), i.get("used_today"),
                    _pct(i.get("bounce_rate_7d"))] for i in outreach["inboxes"]]))
         periods = outreach.get("periods") or {}
         if periods:
             cols = [("today", "Today"), ("week", "Last 7 days"), ("month", "Month to date"), ("ytd", "Year to date")]
-            metrics = [("first_sent", "First touches"), ("followup_sent", "Follow-ups"), ("replies", "Replies"),
-                       ("reply_rate", "Reply rate"), ("owner_replies", "Your replies"), ("bounces", "Bounces"),
-                       ("bounce_rate", "Bounce rate"), ("unsubscribes", "Unsubscribes"),
+            metrics = [("first_sent", "First touches"), ("followup_sent", "Follow-ups"),
+                       ("replies", "Replies reported"), ("reply_rate", "Reply rate"), ("bounces", "Bounces reported"),
+                       ("bounce_rate", "Bounce rate"), ("unsubscribes", "Unsubscribes reported"),
                        ("companies_contacted", "Companies contacted")]
             rows = []
             for key, label in metrics:
@@ -814,6 +818,8 @@ def build_subject(summary, record):
     if outreach:
         sent = (outreach.get("sent_first") or 0) + (outreach.get("sent_followup") or 0)
         parts += [f"{sent} sent", _plural(len(outreach.get("replies") or []), "reply", "replies")]
+        if outreach.get("followups_next"):
+            parts.append(_plural(len(outreach["followups_next"]), "follow-up") + " next")
     parts += [f"{summary['ready_to_email']['count']:,} ready", f"{summary['shortlist']['count']:,} shortlisted"]
     if summary["warnings"]:
         parts.append(_plural(len(summary["warnings"]), "warning"))

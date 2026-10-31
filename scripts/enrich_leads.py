@@ -41,13 +41,16 @@ import requests
 
 from lead_providers import (
     Apollo, BraveSearch, GitHub, Hunter, OpenRouterClient, QuotaTracker, Tomba, ZeroBounce,
-    company_mentioned, company_tokens,
+    backoff_delay, company_mentioned, company_tokens,
 )
 
 try:
     from ddgs import DDGS
+    from ddgs.exceptions import RatelimitException, TimeoutException
+    DDG_THROTTLED = (RatelimitException, TimeoutException)
 except ImportError:  # pure helpers stay importable for tests without ddgs
     DDGS = None
+    DDG_THROTTLED = ()
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(SCRIPT_DIR)
@@ -484,15 +487,18 @@ def resolve_phone(person, providers, company_phones):
 # SEARCH, SITE, LLM
 # ============================================================
 
-def ddg_search(ddg, query, max_results=10, retries=2):
+def ddg_search(ddg, query, max_results=10, retries=3):
     for attempt in range(retries + 1):
         try:
             results = list(ddg.text(query, max_results=max_results) or [])
             time.sleep(random.uniform(2.0, 4.0))  # DDG blocks bursts
             return results
         except Exception as exc:
-            wait = 30 * (attempt + 1)
-            print(f"    duckduckgo {exc.__class__.__name__}; waiting {wait}s")
+            # A plain DDGSException is usually an empty result page: one retry covers a soft block.
+            if attempt >= (retries if isinstance(exc, DDG_THROTTLED) else 1):
+                break
+            wait = backoff_delay(attempt, base=15, cap=120)
+            print(f"    duckduckgo {exc.__class__.__name__}; waiting {wait:.0f}s")
             time.sleep(wait)
     return []
 
@@ -770,7 +776,7 @@ def main():
     if not args.no_llm:
         if os.environ.get("OPENROUTER_API_KEY"):
             client = OpenRouterClient(os.environ["OPENROUTER_API_KEY"], quota, os.environ.get("OPENROUTER_MODEL"), session)
-            print(f"OpenRouter model: {client.model}")
+            print(f"OpenRouter models, best first: {' > '.join(client.models)}")
         else:
             print("OPENROUTER_API_KEY not set; running without LLM cleanup")
 

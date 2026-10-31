@@ -30,6 +30,7 @@ file covers only what was added or changed on top of it.
 | Tests | Unit tests for scoring, write safety, and the provider cap | `scripts/tests/`, `tests/` |
 | Leads | Post-scrape enrichment: top decision makers per company with email, personal emails and phone through a chain of free-tier providers | `scripts/enrich_leads.py`, `scripts/lead_providers.py` |
 | Ops | Daily server run at 18:00 Karachi time with a 3-week job cycle and an evening summary email | `scripts/daily_run.py`, `deploy/` |
+| Outreach | Email queue with warm-up caps, one follow-up after 7 days, duplicate protection and a manual stop list | `scripts/outreach*.py` |
 | Repo | History rewritten to drop 6 GiB of committed scrape output; gitignore fixed | `.gitignore` |
 
 ## 1. Tech-title filter
@@ -65,7 +66,7 @@ each fetcher now populates a `description` field.
 | Platform | How the description is fetched | Extra requests |
 | --- | --- | --- |
 | Greenhouse | `?content=true` added to the board API call; `content` field | none |
-| Ashby | `descriptionPlain` added to the GraphQL selection | none |
+| Ashby | Public posting API `api.ashbyhq.com/posting-api/job-board/{slug}`, `descriptionPlain` field; unlisted postings skipped (the GraphQL board query stopped accepting `descriptionPlain` and returned no jobs) | none |
 | Lever | `descriptionPlain` plus every `lists[].content` block plus `additionalPlain`, joined | none |
 | BambooHR | One call to `/careers/{id}/detail`; reads `description`, `content` or `jobDescription` | 1 per job |
 | Workday | One call to the job's `externalPath` detail endpoint; reads `jobPostingInfo.jobDescription` | 1 per job |
@@ -133,8 +134,9 @@ return different numbers for the same job. See the test status below.
 ## 5. Pipeline and operational changes
 
 - **`--max-jobs-per-provider N`.** `fetch_all_jobs()` stops collecting once a
-  platform has yielded N jobs. Used for short local runs, since a full run with
-  description fetching takes many hours.
+  platform has yielded N jobs and cancels the boards still queued, so the cap
+  also bounds run time; a full run with description fetching takes many hours.
+  Which boards make the cut varies between runs, since the company list is a set.
 - **`write_json_file()`.** Every JSON write in the scraper goes through a
   temp-file-then-`os.replace` helper. This was added after runs on the Ubuntu
   instance failed to overwrite output files that had been left read-only or
@@ -202,8 +204,12 @@ engineering, technology or product.
 
 All optional. A provider is used only when its key is in `.env`, and every
 credit-spending call is counted in `scripts/output/provider_quota.json` so the
-free allowance is never exceeded across runs. A 401, 402, 403 or 429 disables
-that provider for the rest of the run.
+free allowance is never exceeded across runs. A 401, 402 or 403 disables
+that provider for the rest of the run. A 429 is retried with exponential
+backoff (about 2, 4, 8, 16 and 32 seconds, or the server's `Retry-After`) and
+disables the provider only if it persists or the reset is more than 90 seconds
+away, as with Tomba's daily limit. DuckDuckGo rate limits back off 15, 30 and
+60 seconds; an empty result page is retried once.
 
 | Provider | Env key | Free tier (Oct 2026) | Used for |
 | --- | --- | --- | --- |
@@ -211,10 +217,10 @@ that provider for the rest of the run.
 | Brave Search | `BRAVE_API_KEY` | $5 credit/mo, about 1,000 queries | same, when DDG blocks |
 | Apollo | `APOLLO_API_KEY` | people search free; about 75 enrichment credits/mo | names and titles at the domain; work and personal emails |
 | Hunter | `HUNTER_API_KEY` | 50 credits/mo, verify = 0.5 | domain search with pattern, email finder, verifier |
-| Tomba | `TOMBA_API_KEY` + `TOMBA_SECRET` | 25 searches + 50 verifications/mo | domain search, email finder, verifier, phone finder |
+| Tomba | `TOMBA_API_KEY` + `TOMBA_SECRET` | 25 searches + 50 verifications/mo; 2/min and 5/day per endpoint (verifier 10/day) | domain search, email finder, verifier, phone finder |
 | ZeroBounce | `ZEROBOUNCE_API_KEY` | 100 verifications/mo | verifying guesses |
 | GitHub | `GITHUB_TOKEN` optional | 60 req/h, 5,000 with token | public profile emails |
-| OpenRouter | `OPENROUTER_API_KEY` | about 50 req/day on free models | filtering candidates, reading team pages |
+| OpenRouter | `OPENROUTER_API_KEY`, optional `OPENROUTER_MODEL` (comma list, best first) | 50 req/day across free models, 1,000 after a lifetime $10 credit purchase | filtering candidates, reading team pages |
 
 Snov.io, Lusha, RocketReach and Kaspr were considered and left out: none of
 them offers API access on a free plan.
@@ -230,7 +236,10 @@ them offers API access on a free plan.
    and leadership pages.
 4. One OpenRouter call to drop non-buyers and add people named with a senior
    technical title in the site text. Emails and ids already attached by
-   providers are kept through this step.
+   providers are kept through this step. The call goes to the best model in
+   the chain that is not resting; a busy or empty-answering model rests 30
+   seconds (or its `Retry-After`), doubling each time it fails again, and a
+   retired model sits out the run.
 5. For each decision maker, the email waterfall stops at the first source at
    or above `--min-confidence` (default 70):
 
@@ -285,8 +294,8 @@ fake providers, and the quota tracker. No network needed.
 
 `scripts/daily_run.py` runs the pipeline once a day on the Oracle instance and
 emails a summary. systemd starts it at 18:00 Asia/Karachi
-(`deploy/jba-daily.timer`), which is 8 or 9 AM in New York. The full plan,
-including the outreach stages still to come, is in `docs/outreach-plan.md`.
+(`deploy/jba-daily.timer`), which is 8 or 9 AM in New York. The full plan is in
+`docs/outreach-plan.md`; section 11 covers the outreach steps.
 
 Each step is a child process with its own log and timeout. A failed step never
 stops the summary, and a crash still sends a short email with the error.
@@ -354,6 +363,91 @@ records `email_pattern_source` per company.
 Tests: `scripts/tests/test_daily_run.py` covers the cycle rule, summary
 numbers, run records, email building, config parsing and the step runner, and
 `test_enrich_leads.py` gained cases for the new flags. No network needed.
+
+## 11. Outreach queue and sending
+
+`scripts/outreach.py` is the email queue. `daily_run.py` calls three of its
+steps every evening (`run`, `topup`, `ingest`); the rest are commands you run
+by hand on the server. Sending goes through the SMTP account in `.env`. Zoho's
+free plan has no IMAP, so nothing reads the inbox: replies, unsubscribes and
+bounces are reported with `stop`.
+
+**Modes** (`OUTREACH_MODE`). `off` sends nothing and spends no credits.
+`review` writes each email as an `.eml` file to
+`scripts/output/drafts/YYYY-MM-DD/` and spends verification credits. `send`
+delivers through inboxes that are `ready`. The template email is a placeholder;
+`send` is for after the real copy is written and approved.
+
+**Each evening:**
+
+1. `run`: follow-ups that are due go first, then first emails, within each
+   inbox's warm-up cap (`OUTREACH_WARMUP=5:7,10:7,20`: 5 a day for a week, 10
+   for a week, then 20). Weekdays only in `OUTREACH_DEFAULT_TZ`, 60 to 180
+   seconds apart. Drafts count toward the cap, so `review` shows exactly what
+   `send` would do.
+2. `topup`: Hunter, Tomba, Apollo and ZeroBounce credits go to the next people
+   in line until the queue holds `OUTREACH_TOPUP_DAYS` (3) days of sends. One
+   person per company is tried at a time, most senior first; a personal address
+   is used only when the work address cannot be verified.
+3. `ingest`: the day's `leads.json` goes into `scripts/output/outreach.db`,
+   with up to three of the company's job postings stored next to each person.
+   A verified address is never replaced by a weaker guess. The queue is written
+   to `runs/YYYY-MM-DD.queue.csv` (attached to the summary) and the database is
+   copied to `scripts/output/backups/` (14 kept).
+
+**Who gets a first email.** A verified address (confidence 90 or more), one
+person per company (the most senior, an engineering buyer first), a company
+whose job was still listed in the latest scrape, and no email to that company
+in the last 90 days. Never role addresses (info@, sales@, ...), never the
+sending domain, never a stopped address or domain.
+
+**Nobody is emailed twice.** Before a first email the address, the person,
+their LinkedIn profile and their name at the company domain are checked against
+everything already sent. Addresses are compared as mailboxes: case, `+tags` and
+Gmail's dots are ignored, so `Jane.Doe+jobs@gmail.com` and `janedoe@gmail.com`
+are the same person. The database also refuses a second first email to the same
+mailbox or person and a second follow-up in a thread, so even a bug or two runs
+at once cannot double-send. A follow-up goes 7 days later
+(`OUTREACH_FOLLOWUP_DAYS`), once, to the address of its first email, as a reply
+in the same thread.
+
+**Stopping follow-ups.** When someone replies, unsubscribes or bounces:
+
+```
+.venv/bin/python scripts/outreach.py stop jane@acme.com                    # replied (the default reason)
+.venv/bin/python scripts/outreach.py stop bob@beta.io --reason unsubscribed
+.venv/bin/python scripts/outreach.py stop --file stop.txt                  # one address per line, # comments
+.venv/bin/python scripts/outreach.py stop @acme.com --reason other         # a whole company
+.venv/bin/python scripts/outreach.py unstop jane@acme.com                  # undo
+```
+
+A stop cancels the pending follow-up and blocks the address, and every other
+address known for that person, for good. It takes effect immediately, even
+during a run. The summary lists the follow-ups due at the next run so you can
+stop anyone who already replied, and it shows what you stopped since the last
+run. Unsubscribes must be honoured within 10 business days. Three reported
+bounces in 7 days, or more than 3% after 20 sends, pause the inbox until
+`resume`.
+
+**Inboxes.** `add-inbox --address ... --display-name ...` registers one as
+`pending` and tests the SMTP login. A pending inbox drafts in `review` mode;
+it sends only after the inbox checks (next stage) mark it `ready`. `pause`,
+`resume [--restart-warmup]` and `list-inboxes` manage them. The password stays
+in `.env`; the database stores only the name of the key (`--pass-env`,
+default `SMTP_PASS`).
+
+**Status.** `outreach.py status` prints inboxes, the queue, follow-ups due in
+the next 7 days, and totals for today, the last 7 days, the month and the year
+(first emails, follow-ups, reported replies and bounces, unsubscribes,
+companies). `status --stopped` lists every stopped address.
+
+Once `scripts/outreach.py` exists, `daily_run.py` switches enrichment to
+discovery only, so credits are spent by `topup` just ahead of sending. In
+`off` mode nothing spends credits; use `review` to see the queue fill.
+
+Tests: `scripts/tests/test_outreach.py` covers each duplicate rule, the stop
+list, follow-ups, warm-up caps, weekend holds, review drafts, SMTP failures,
+the top-up and the copy checks. No network needed.
 
 ## Running a scrape
 
