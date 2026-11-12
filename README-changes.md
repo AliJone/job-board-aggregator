@@ -88,7 +88,7 @@ anyway, two regexes pull the "Job Location" value out of it and pass it through
 `evaluate_lead_intent(job)` in `scripts/scraper.py` concatenates title,
 description and company, normalises the text (HTML entities unescaped twice,
 zero-width characters removed, tags replaced with spaces, whitespace collapsed,
-lowercased) and runs it against six regex buckets.
+lowercased) and runs it against seven regex buckets.
 
 | Bucket | Weight | Signal it captures | Examples |
 | --- | --- | --- | --- |
@@ -97,6 +97,7 @@ lowercased) and runs it against six regex buckets.
 | `hardSecurity` | +3 | Auth, tenancy, webhook and identity controls | multi-tenant isolation, OAuth 2.0, row-level security |
 | `technicalDebt` | +4 | Legacy, rewrites, urgency, founding-stage pressure | technical debt, legacy monoliths, zero to one |
 | `manualArchitecture` | +2 | Single-word architecture terms | gRPC, Kafka, RBAC, ACID |
+| `teamStack` | +2 | Stacks and roles the drawnonward team covers (a fit signal) | React, Node.js, Next.js, Nuxt, Vue, React Native, Flutter, Go, .NET, QA automation, DevOps, UI/UX, project management |
 | `noiseFilter` | -10 and veto | Low-value or no-code work | Webflow, WordPress, landing page, thin wrapper, Zapier |
 
 Per bucket the Python scorer adds `weight × min(hits, 3)`, so a description
@@ -105,8 +106,9 @@ alone. The noise bucket adds a flat -10 and sets `is_excluded`.
 
 `clean_job_data()` now runs the scorer on every job after the upstream
 title/url/company checks. Jobs flagged by the noise bucket are dropped and
-counted under a new `low_signal` reason. Survivors get two new fields,
-`lead_intent_score` and `lead_intent_matches`, and both the full output and
+counted under a new `low_signal` reason. Survivors get three new fields,
+`lead_intent_score`, `lead_intent_matches` and `lead_intent_terms` (the
+phrases each bucket matched), and both the full output and
 the frontend chunks are sorted by score descending, then company, then title.
 
 **Why these weights.** Technical debt is weighted highest because a company
@@ -115,7 +117,10 @@ engineering help. Security is next because it is rarely optional and rarely
 done in-house by small teams. Scale and data work are broad enough that they
 earn points but do not decide the ranking on their own. The noise bucket is a
 veto rather than a penalty because a Webflow or WordPress role indicates a
-company that buys marketing sites, not systems work.
+company that buys marketing sites, not systems work. `teamStack` sits with the
+smaller buckets: two stack hits (4 points) are enough to reach the shortlist on
+their own, but a stack match never outranks a real pain signal. The browser
+copy in `js/lead_intent_scoring.js` does not include it.
 
 ## 4. Frontend changes
 
@@ -375,8 +380,9 @@ bounces are reported with `stop`.
 **Modes** (`OUTREACH_MODE`). `off` sends nothing and spends no credits.
 `review` writes each email as an `.eml` file to
 `scripts/output/drafts/YYYY-MM-DD/` and spends verification credits. `send`
-delivers through inboxes that are `ready`. The template email is a placeholder;
-`send` is for after the real copy is written and approved.
+delivers through inboxes that are `ready`, and only once `SENDER_ADDRESS_LINE`
+holds a postal address (US law wants one in every commercial email). The copy
+is under **The email** below.
 
 **Each evening:**
 
@@ -388,9 +394,12 @@ delivers through inboxes that are `ready`. The template email is a placeholder;
 2. `topup`: Hunter, Tomba, Apollo and ZeroBounce credits go to the next people
    in line until the queue holds `OUTREACH_TOPUP_DAYS` (3) days of sends. One
    person per company is tried at a time, most senior first; a personal address
-   is used only when the work address cannot be verified.
+   is used only when the work address cannot be verified. A finder's own score
+   (Tomba's 99, say) never counts as verified on its own: the address is checked
+   by a verifier before it can be sent to.
 3. `ingest`: the day's `leads.json` goes into `scripts/output/outreach.db`,
-   with up to three of the company's job postings stored next to each person.
+   with up to three of the company's job postings (full text) stored next to
+   each person, the ones someone on the team fits first.
    A verified address is never replaced by a weaker guess. The queue is written
    to `runs/YYYY-MM-DD.queue.csv` (attached to the summary) and the database is
    copied to `scripts/output/backups/` (14 kept).
@@ -398,8 +407,85 @@ delivers through inboxes that are `ready`. The template email is a placeholder;
 **Who gets a first email.** A verified address (confidence 90 or more), one
 person per company (the most senior, an engineering buyer first), a company
 whose job was still listed in the latest scrape, and no email to that company
-in the last 90 days. Never role addresses (info@, sales@, ...), never the
-sending domain, never a stopped address or domain.
+in the last 90 days, and a posting someone on the team fits. Never role
+addresses (info@, sales@, ...), never the sending domain, never a stopped
+address or domain.
+
+**The team and the match.** `data/talent.json` lists the people we can offer.
+It is gitignored because the repo is public; copy it to the server like
+`.env`. Without it no first email is written and the summary says so.
+
+```json
+{"people": [
+  {"name": "...", "family": "engineering", "role": "full-stack engineer", "years": 8,
+   "skills": ["Node", "Next.js", "React", ".NET"]},
+  {"name": "...", "family": "qa", "role": "QA engineer", "years": 5,
+   "skill_years": {"test automation": 5, "manual testing": 2}},
+  {"name": "...", "family": "devops", "role": "DevOps engineer", "years": 9, "skills": []},
+  {"name": "...", "family": "design", "role": "UI/UX designer", "years": 5, "years_text": "5+ years"},
+  {"name": "...", "family": "pm", "role": "project manager", "years": 10}
+]}
+```
+
+`scripts/outreach_match.py` reads the posting's title for the kind of role
+(engineering, mobile, QA, DevOps, UI/UX design, project management) and its
+text for the roster's skills. Product Manager is not project management, and
+graphic, interior or architectural design is not UI/UX. Engineering and mobile
+postings need at least one skill named in both the posting and a person's list;
+the person with the most shared skills is offered, then the most years. A
+backend posting counts only Node, Go and .NET. Adding skills to a DevOps or
+design person turns on the skills sentence for them. A company is skipped,
+before any credit is spent on it, when nobody fits (`no_roster_match`), when
+the posting asks for more than 3 years above the person's (`years_gap`; a
+company's own "14 years of experience" is ignored), or when it needs someone on
+site: residency, clearance, in-office, or hybrid outside a remote location
+(`location_blocker`).
+
+**The email.** Subject `Your <job title> role`. The first email:
+
+```
+Hi <first name>,
+
+I saw the <job title> role at <company>.
+
+We have a senior <role> with <years> of experience, including <shared skills>
+from your posting. They can join your team through us.
+
+You skip the search. Read one CV, talk with them if it looks right, then decide.
+
+I run drawnonward, a software agency in Karachi.
+
+Want me to send the CV?
+```
+
+QA names one skill with its own years ("5 years of test automation, which your
+posting asks for"); design and DevOps without listed tools give role and years;
+project management adds "and multiple certifications". "senior" is used from 5
+years up. The person is never named in the email; the summary's Offered column
+says whose CV to send when they reply. The follow-up, 7 days later in the same
+thread:
+
+```
+Hi <first name>,
+
+One more thought on the <job title> role. From the posting, the work involves
+<phrase>, which is hard to put on hold.
+
+When a senior seat sits empty, the rest of the team picks up its work. The
+<role> I mentioned can take some of that on while you keep looking for the right
+hire, so you do not have to rush it or settle.
+
+Reply "CV" and I will send it over.
+```
+
+The sentence about the posting is used only for engineering and DevOps roles,
+and only when a bucket matched an unambiguous phrase: "technical debt" or
+"legacy monoliths" count as rework, "zero to one" and "production-ready" do not,
+and "ACID" counts only next to "transaction". The company name is taken from
+the posting when the posting names itself (`getzuma` becomes `Zuma`,
+`reflectionai` becomes `Reflection AI`, `srsdistribution` becomes `SRS
+Distribution`); otherwise slug names are cleaned up and all-caps names are
+softened (`OPENLANE` becomes `Openlane`).
 
 **Nobody is emailed twice.** Before a first email the address, the person,
 their LinkedIn profile and their name at the company domain are checked against
@@ -430,8 +516,9 @@ bounces in 7 days, or more than 3% after 20 sends, pause the inbox until
 `resume`.
 
 **Inboxes.** `add-inbox --address ... --display-name ...` registers one as
-`pending` and tests the SMTP login. A pending inbox drafts in `review` mode;
-it sends only after the inbox checks (next stage) mark it `ready`. `pause`,
+`pending` and tests the SMTP login. A pending inbox drafts in `review` mode.
+`ready ADDRESS` tests the login again, marks it `ready` and starts its warm-up
+from day 1; only ready inboxes send. `pause`,
 `resume [--restart-warmup]` and `list-inboxes` manage them. The password stays
 in `.env`; the database stores only the name of the key (`--pass-env`,
 default `SMTP_PASS`).
@@ -447,7 +534,8 @@ discovery only, so credits are spent by `topup` just ahead of sending. In
 
 Tests: `scripts/tests/test_outreach.py` covers each duplicate rule, the stop
 list, follow-ups, warm-up caps, weekend holds, review drafts, SMTP failures,
-the top-up and the copy checks. No network needed.
+the top-up, the roster match and its gates, and the copy checks. No network
+needed.
 
 ## Running a scrape
 

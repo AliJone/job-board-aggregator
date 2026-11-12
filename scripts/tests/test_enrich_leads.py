@@ -23,7 +23,7 @@ from enrich_leads import (
     split_providers,
     verify_email,
 )
-from lead_providers import OpenRouterClient, Provider, QuotaTracker, normalize_verdict, template_to_pattern
+from lead_providers import OpenRouterClient, Provider, QuotaTracker, Tomba, normalize_verdict, template_to_pattern
 
 
 class FakeProvider:
@@ -151,6 +151,14 @@ class WaterfallTests(unittest.TestCase):
         self.assertEqual(verified["email"], "jdoe@acme.com")
         self.assertEqual(verified["email_confidence"], CONFIDENCE["verified"])
         self.assertEqual(verifier.verify_calls, ["jane.doe@acme.com", "jdoe@acme.com"])
+
+    def test_a_finder_score_alone_never_counts_as_verified(self):
+        tomba = FakeProvider("tomba", finder={"email": "kim@acme.com", "confidence": 99, "source": "tomba email finder"})
+        found = resolve_email({"name": "Kim Lee"}, "acme.com", "Acme", [], None, None, {"tomba": tomba}, min_conf=90)
+        self.assertEqual(found["email_confidence"], CONFIDENCE["verified"] - 1)
+        verifier = FakeProvider("zerobounce", verdicts=["valid"])
+        verified = verify_email(found, {"zerobounce": verifier})
+        self.assertEqual((verifier.verify_calls, verified["email_confidence"]), (["kim@acme.com"], CONFIDENCE["verified"]))
 
     def test_verify_email_skips_already_verified(self):
         verifier = FakeProvider("zerobounce", verdicts=["invalid"])
@@ -336,6 +344,22 @@ class OpenRouterChainTests(ClockTestCase):
         self.assertEqual(client.chat("s", "u"), "after the wait")
         self.assertEqual(session.calls, ["best", "best"])
         self.assertTrue(24 <= sum(self.clock.slept) <= 36)
+
+
+class TombaResponseTests(ClockTestCase):
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.quota = QuotaTracker(os.path.join(tmp.name, "quota.json"))
+
+    def test_finder_reads_the_flat_email_record(self):
+        found = FakeSession([FakeResponse(200, {"data": {"email": "Jane@Acme.com", "score": 97, "position": "CTO",
+                                                         "phone_number": False}})])
+        hit = Tomba("k", "s", self.quota, found).email_finder("Jane", "Doe", "acme.com")
+        self.assertEqual((hit["email"], hit["confidence"], hit["phone"]), ("jane@acme.com", 97, None))
+        empty = FakeSession([FakeResponse(200, {"data": {"email": None}})])
+        self.assertIsNone(Tomba("k", "s", self.quota, empty).email_finder("Jane", "Doe", "acme.com"))
 
 
 class RateLimitBackoffTests(ClockTestCase):

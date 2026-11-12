@@ -322,7 +322,9 @@ class Tomba(Provider):
             "domain": domain, "first_name": first, "last_name": last})
         if data is None:
             return None
-        e = (data.get("data") or {}).get("email") or {}
+        d = data.get("data") or {}
+        # the finder puts the record itself under data; only the verifier nests it under data.email
+        e = d["email"] if isinstance(d.get("email"), dict) else d
         if not e.get("email"):
             return None
         self.quota.spend(self.name, 1)

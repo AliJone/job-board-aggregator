@@ -622,9 +622,16 @@ def summary_blocks(summary, record):
             line += (f" {_plural(drafts, 'draft')} {'is' if drafts == 1 else 'are'} waiting for review in "
                      f"scripts/output/drafts/{record.get('run_date')}/.")
         add(("p", line))
+        # Offered is whose CV to send when they reply
         if outreach.get("sent"):
-            add(("table", ["Name", "Company", "Kind", "Subject"],
-                 [[m.get("name"), m.get("company"), m.get("kind"), m.get("subject")] for m in outreach["sent"]]))
+            add(("table", ["Name", "Company", "Kind", "Subject", "Offered"],
+                 [[m.get("name"), m.get("company"), m.get("kind"), m.get("subject"), m.get("offered")]
+                  for m in outreach["sent"]]))
+        if outreach.get("drafted"):
+            add(("p", "Drafts written, not sent:"))
+            add(("table", ["Name", "Company", "Email", "Kind", "Subject", "Offered"],
+                 [[m.get("name"), m.get("company"), m.get("email"), m.get("kind"), m.get("subject"),
+                   m.get("offered")] for m in outreach["drafted"]]))
         stopped = outreach.get("stopped_today") or []
         if stopped:
             add(("p", f"Stopped by you since the last run: {len(stopped)}."))

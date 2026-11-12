@@ -13,11 +13,30 @@ from zoneinfo import ZoneInfo
 
 import outreach
 import outreach_mail as mail
+import outreach_match as match
 import outreach_store as store
 from outreach import Settings
-from outreach_compose import compose, full_text, lint_copy, lint_message
+from outreach_compose import (compose, display_company, full_text, join_words, lint_copy, lint_message, offer_line,
+                              pain_bucket)
 
 INBOX = "ali@drawnonward.org"
+# made-up people; the real roster stays in the gitignored data/talent.json
+ROSTER = [
+    {"name": "Sam Go", "family": "engineering", "role": "full-stack engineer", "years": 7,
+     "skills": ["Go", "React", "Node", "Vue"]},
+    {"name": "Kim Net", "family": "engineering", "role": "full-stack engineer", "years": 8,
+     "skills": ["Node", "React", ".NET"]},
+    {"name": "Mo Bile", "family": "engineering", "role": "mobile and full-stack engineer", "years": 8,
+     "skills": ["React Native", "Flutter", "Node", "React"]},
+    {"name": "Jo New", "family": "engineering", "role": "full-stack engineer", "years": 4, "skills": ["React", "Node"]},
+    {"name": "Ann Auto", "family": "qa", "role": "QA engineer", "years": 5,
+     "skill_years": {"test automation": 5, "manual testing": 2}},
+    {"name": "Max Hand", "family": "qa", "role": "QA engineer", "years": 5,
+     "skill_years": {"manual testing": 5, "test automation": 3}},
+    {"name": "Pat Ops", "family": "devops", "role": "DevOps engineer", "years": 9, "skills": []},
+    {"name": "Dee Sign", "family": "design", "role": "UI/UX designer", "years": 5, "years_text": "5+ years"},
+    {"name": "Pam Plan", "family": "pm", "role": "project manager", "years": 10},
+]
 
 
 def weekday_now(offset_days=0):
@@ -48,7 +67,8 @@ def company(key, people, score=10, domain=None):
 
 def job(key, score=10, title="Staff Engineer"):
     return {"company": key, "title": title, "url": f"https://jobs.example/{key}", "location": "Remote",
-            "lead_intent_score": score, "lead_intent_matches": {"highScale": True}, "description": "<p>Scale it</p>"}
+            "lead_intent_score": score, "lead_intent_matches": {"highScale": True},
+            "description": "<p>Scale it with React and Node.</p>"}
 
 
 class FakeSMTP:
@@ -102,7 +122,8 @@ class OutreachCase(unittest.TestCase):
         self.tmp = stack.enter_context(tempfile.TemporaryDirectory())
         self.conn = stack.enter_context(store.connect(os.path.join(self.tmp, "outreach.db")))
         self.settings = Settings(mode="send", gap=(0, 0), sender_name="Ali Jone", topup_days=1,
-                                 sender_address_line="Karachi, Pakistan", own_domains={"drawnonward.org"})
+                                 sender_address_line="Karachi, Pakistan", own_domains={"drawnonward.org"},
+                                 roster=ROSTER)
         self.now = weekday_now()
         self.today = self.now.date().isoformat()
         self.sleeps = []
@@ -146,6 +167,20 @@ class KeyTests(unittest.TestCase):
     def test_linkedin_key(self):
         self.assertEqual(store.linkedin_key("https://www.linkedin.com/in/Jane-Doe/?trk=x"), "jane-doe")
         self.assertIsNone(store.linkedin_key("https://example.com/in/jane"))
+
+
+class ReadyCommandTests(unittest.TestCase):
+    def test_ready_starts_the_warmup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "outreach.db")
+            with store.connect(db) as conn:
+                store.add_inbox(conn, INBOX, "Ali Jone", "smtp.zoho.com", 465, INBOX)
+            self.assertEqual(outreach.main(["--db", db, "ready", INBOX, "--no-check"]), 0)
+            with store.connect(db) as conn:
+                inbox = store.get_inbox(conn, INBOX)
+            self.assertEqual(inbox["status"], "ready")
+            self.assertTrue(inbox["warmup_started_at"])
+            self.assertEqual(outreach.main(["--db", db, "ready", "nobody@example.com", "--no-check"]), 1)
 
 
 class WarmupTests(unittest.TestCase):
@@ -365,6 +400,17 @@ class StopTests(OutreachCase):
         self.assertEqual(stats["paused_inboxes"][0]["address"], INBOX)
 
 
+class AddressLineTests(OutreachCase):
+    def test_no_real_send_without_a_postal_address(self):
+        self.add_inbox()
+        self.ingest([company("acme", [person("Jane Doe", email="jane@acme.com")])])
+        self.settings.sender_address_line = ""
+        stats = self.send()
+        self.assertEqual((stats["sent_first"], self.smtp.sent), (0, []))
+        self.assertIn("postal address", " ".join(stats["errors"]))
+        self.assertEqual(self.send(mode="review")["drafts_written"], 1)
+
+
 class RunModeTests(OutreachCase):
     def setUp(self):
         super().setUp()
@@ -411,21 +457,127 @@ class RunModeTests(OutreachCase):
         self.assertEqual(self.send(now=weekday_now(1), smtp=FakeSMTP())["sent_first"], 3)
 
 
+class MatchTests(unittest.TestCase):
+    def fit(self, title, text="", location="Remote"):
+        return match.job_fit({"title": title, "excerpt": text, "location": location}, ROSTER)
+
+    def test_role_family_from_the_title(self):
+        cases = {"Product Manager": None, "Senior Project Manager": "pm", "Engineering Manager": None,
+                 "Graphic Designer": None, "Designer II - Interiors": None, "Aeronautical Test Engineer": None,
+                 "QA Automation Senior (contractor)": "qa", "Senior Product Designer": "design",
+                 "UX Engineer": "engineering", "Site Reliability Engineer": "devops", "Senior iOS Engineer": "mobile",
+                 "Member of Technical Staff": "engineering", "Data Engineer": None, "Solutions Engineer": None}
+        for title, family in cases.items():
+            self.assertEqual(match.role_family(title), family, title)
+
+    def test_skills_in_posting_order_without_lookalikes(self):
+        text = "Our stack: Go, React Native and React. Node.js services, some ASP.NET."
+        self.assertEqual(match.skills_in(text, ["React", ".NET", "Node", "React Native", "Go"]),
+                         ["Go", "React Native", "React", "Node", ".NET"])
+        noise = "Go to market with partners at example.net. React quickly; each node in the graph is reactive."
+        self.assertEqual(match.skills_in(noise, ["React", ".NET", "Node", "Go"]), [])
+
+    def test_most_matched_skills_then_years(self):
+        fit, _ = self.fit("Member of Technical Staff", "React, TypeScript, gRPC, FastAPI and Go")
+        self.assertEqual((fit["name"], fit["skills"], fit["line"]), ("Sam Go", ["React", "Go"], "skills"))
+        self.assertEqual(self.fit("Frontend Engineer", "We use React.")[0]["name"], "Kim Net")
+        self.assertEqual(self.fit("Senior Mobile Engineer", "Flutter and Node")[0]["name"], "Mo Bile")
+        self.assertEqual(self.fit("Senior iOS Engineer", "Swift and React")[1], "no_roster_match")
+        self.assertEqual(self.fit("Backend Engineer", "Python and Rust")[1], "no_roster_match")
+        self.assertEqual(self.fit("Product Manager", "React")[1], "no_roster_match")
+        self.assertEqual(self.fit("Senior Project Manager", "Run sprints with our developers")[0]["name"], "Pam Plan")
+        self.assertEqual(self.fit("Project Manager", "Site schedules and subcontractors")[1], "no_roster_match")
+        self.assertEqual(self.fit("Software Engineer, Backend", "Our React app talks to Node services")[0]["skills"],
+                         ["Node"])
+        self.assertEqual(self.fit("Developer Go / Integraciones API", "Senior")[0]["skills"], ["Go"])
+
+    def test_qa_names_one_skill_with_its_own_years(self):
+        fit, _ = self.fit("QA Engineer", "Cypress and Playwright suites, plus manual testing")
+        self.assertEqual((fit["name"], fit["years_text"], fit["skills"], fit["line"]),
+                         ("Ann Auto", "5 years", ["test automation"], "qa"))
+        self.assertEqual(self.fit("QA Engineer", "Manual testing of releases")[0]["name"], "Max Hand")
+        self.assertEqual(self.fit("QA Engineer", "Help our developers ship")[0]["line"], "plain")
+        self.assertEqual(self.fit("Test Engineer", "Thermal chambers and fixtures")[1], "no_roster_match")
+        self.assertEqual(self.fit("Automation Engineer", "PLC and SCADA")[1], "no_roster_match")
+
+    def test_years_and_location_gates(self):
+        self.assertEqual(match.required_years("Requirements: 2-5 years of experience"), 2)
+        self.assertEqual(match.required_years("Founded 12 years ago. 6+ years building APIs"), 6)
+        self.assertEqual(match.required_years("Somos una empresa con más de 14 años de experiencia. "
+                                              "Esperamos +5 años de experiencia en AWS"), 5)
+        self.assertEqual(self.fit("Senior Product Designer", "10+ years of product design")[1], "years_gap")
+        self.assertTrue(self.fit("Staff Engineer", "8+ years with React")[0])
+        self.assertEqual(self.fit("QA Engineer", "Selenium. Must reside in Chile")[1], "location_blocker")
+        self.assertEqual(self.fit("Staff Engineer", "React, hybrid in our office", "New York")[1], "location_blocker")
+        self.assertTrue(self.fit("Staff Engineer", "React, hybrid or remote", "Remote - US")[0])
+        self.assertEqual(self.fit("Staff Engineer", "React; TS/SCI clearance required")[1], "location_blocker")
+
+    def test_best_fit_takes_a_fitting_posting_and_names_the_blocker(self):
+        jobs = [{"title": "Data Scientist", "excerpt": "Python"}, {"title": "Full Stack Engineer", "excerpt": "React"}]
+        self.assertEqual(match.best_fit(jobs, ROSTER)[0]["job"]["title"], "Full Stack Engineer")
+        blocked = [{"title": "Data Scientist", "excerpt": ""}, {"title": "Staff Engineer", "excerpt": "React. 15+ years"}]
+        self.assertEqual(match.best_fit(blocked, ROSTER), (None, "years_gap"))
+        self.assertEqual(match.best_fit([], ROSTER), (None, "no_roster_match"))
+        self.assertEqual(match.best_fit(jobs, []), (None, "no_roster_match"))
+
+
 class ComposeTests(unittest.TestCase):
     settings = Settings(sender_name="Ali Jone", sender_address_line="Karachi, Pakistan")
     inbox = {"address": INBOX, "display_name": "Ali Jone"}
     lead = {"name": "Jane Doe", "company": "Acme"}
-    job = {"title": "Staff Software Engineer, Platform (Remote)", "buckets": ["highScale"]}
+    job = {"title": "Staff Software Engineer, Platform (Remote)", "excerpt": "React and Go", "location": "Remote",
+           "terms": {"technicalDebt": ["zero to one"], "dataIntegrity": ["schema migrations"]}}
 
-    def test_template_passes_every_check(self):
-        first = compose(self.lead, self.job, self.inbox, "first", self.settings)
-        follow = compose(self.lead, self.job, self.inbox, "followup", self.settings, parent_subject=first["subject"])
-        self.assertEqual(first["subject"], "Staff Software Engineer candidates")
-        self.assertEqual([i for i in lint_copy(first["subject"], first["body"], "first") if i[0] == "error"], [])
-        self.assertEqual([i for i in lint_copy(follow["subject"], follow["body"], "followup") if i[0] == "error"], [])
-        plain = compose(self.lead, {"title": "Staff Engineer"}, self.inbox, "first", self.settings)
-        self.assertNotIn("posting mentions", plain["body"])
-        self.assertEqual([i for i in lint_copy(plain["subject"], plain["body"], "first") if i[0] == "error"], [])
+    def test_copy_passes_every_check(self):
+        fit = match.best_fit([self.job], ROSTER)[0]
+        first = compose(self.lead, fit["job"], self.inbox, "first", self.settings, fit=fit)
+        self.assertEqual(first["subject"], "Your Staff Software Engineer role")
+        self.assertIn("We have a senior full-stack engineer with 7 years of experience, including React and Go from "
+                      "your posting. They can join your team through us.", first["body"])
+        follow = compose(self.lead, fit["job"], self.inbox, "followup", self.settings,
+                         parent_subject=first["subject"], fit=fit, parent_body=first["body"])
+        self.assertEqual(follow["subject"], "Re: Your Staff Software Engineer role")
+        self.assertIn("role. From the posting, the work involves data that has to stay correct,", follow["body"])
+        self.assertIn("The full-stack engineer I mentioned", follow["body"])
+        self.assertEqual(lint_copy(first["subject"], first["body"], "first"), [])
+        self.assertEqual(lint_copy(follow["subject"], follow["body"], "followup"), [])
+
+    def test_offer_lines_by_role(self):
+        def line(**fit):
+            return offer_line({"skills": [], "line": "plain", "years_text": f"{fit['years']} years", **fit})
+        self.assertEqual(line(role="full-stack engineer", years=4, skills=["React"], line="skills"),
+                         "We have a full-stack engineer with 4 years of experience, including React from your posting.")
+        self.assertEqual(line(role="QA engineer", years=5, skills=["test automation"], line="qa"),
+                         "We have a senior QA engineer with 5 years of test automation, which your posting asks for.")
+        self.assertEqual(line(role="UI/UX designer", years=5, years_text="5+ years"),
+                         "We have a senior UI/UX designer with 5+ years of experience.")
+        self.assertEqual(line(role="project manager", years=10, line="pm"),
+                         "We have a senior project manager with 10 years of experience and multiple certifications.")
+        self.assertEqual(join_words(["Go", "React", "Node"]), "Go, React and Node")
+
+    def test_follow_up_line_uses_strong_phrases_only(self):
+        weak = {**self.job, "excerpt": "React and Go. Nucleic acid assays.",
+                "terms": {"technicalDebt": ["zero to one", "production-ready"], "manualArchitecture": ["acid"]}}
+        self.assertIsNone(pain_bucket(weak, "engineering"))
+        debt = {**weak, "terms": {"technicalDebt": ["technical debt"]}}
+        self.assertEqual(pain_bucket(debt, "engineering"), "technicalDebt")
+        self.assertIsNone(pain_bucket(debt, "qa"))
+        self.assertEqual(pain_bucket({**weak, "excerpt": "ACID transactions"}, "engineering"), "manualArchitecture")
+        follow = compose(self.lead, weak, self.inbox, "followup", self.settings,
+                         parent_subject="Your Staff Software Engineer role", fit=match.best_fit([weak], ROSTER)[0],
+                         parent_body="We have a senior full-stack engineer with 7 years")
+        self.assertIn("One more thought on the Staff Software Engineer role.\n\n", follow["body"])
+
+    def test_company_names_read_like_a_person_wrote_them(self):
+        cases = {"OPENLANE": "Openlane", "Reflectionai": "Reflection AI", "redbee": "redbee", "Bonsai": "Bonsai",
+                 "Shanghai": "Shanghai", "Acme Labs": "Acme Labs", "Futurelabs": "Future Labs"}
+        for raw, shown in cases.items():
+            self.assertEqual(display_company(raw), shown)
+        posting = "About Zuma Zuma is pioneering agentic AI. Zuma is scaling rapidly."
+        self.assertEqual(display_company("Getzuma", posting), "Zuma")
+        self.assertEqual(display_company("Reflectionai", "At Reflection AI, we build frontier models."), "Reflection AI")
+        self.assertEqual(display_company("Gettyimages", "Getty Images is hiring. Ty works here."), "Getty Images")
+        self.assertEqual(display_company("Getzuma", "Zuma once."), "Getzuma")
 
     def test_full_text_adds_signature_and_opt_out(self):
         text = full_text("Hi Jane,\n\nShort note.", self.settings, self.inbox)
@@ -483,7 +635,7 @@ class IngestTests(OutreachCase):
                      company("beta", [person("Bo Kim", email="bo@beta.com")])])
         lead = store.all_leads(self.conn)[0]
         self.assertEqual(lead["jobs_snapshot"][0]["buckets"], ["highScale"])
-        self.assertEqual(lead["jobs_snapshot"][0]["excerpt"], "Scale it")
+        self.assertEqual(lead["jobs_snapshot"][0]["excerpt"], "Scale it with React and Node.")
         # the next scrape no longer lists beta's job
         newer = (self.now + timedelta(days=21)).date().isoformat()
         self.ingest([], jobs=[job("acme")], scrape_date=newer)
@@ -491,6 +643,20 @@ class IngestTests(OutreachCase):
         self.assertEqual(self.sent_to(), ['Jane Doe <jane@acme.com>'])
         self.assertEqual(stats["skipped_reasons"].get("job_closed"), 1)
         self.assertEqual(store.all_leads(self.conn)[1]["jobs_snapshot"][0]["title"], "Staff Engineer")
+
+    def test_a_fitting_posting_comes_first_and_unfit_companies_are_skipped(self):
+        self.add_inbox()
+        science = {**job("acme", score=30, title="Data Scientist"), "description": "<p>Python</p>"}
+        self.ingest([company("acme", [person("Jane Doe", email="jane@acme.com")]),
+                     company("beta", [person("Bo Kim", email="bo@beta.com")])],
+                    jobs=[science, job("acme", score=4, title="Full Stack Engineer"),
+                          {**job("beta", title="Data Scientist"), "description": "<p>Python</p>"}])
+        acme = [l for l in store.all_leads(self.conn) if l["company_key"] == "acme"][0]
+        self.assertEqual(acme["jobs_snapshot"][0]["title"], "Full Stack Engineer")
+        stats = self.send()
+        self.assertEqual(self.sent_to(), ["Jane Doe <jane@acme.com>"])
+        self.assertEqual(stats["skipped_reasons"].get("no_roster_match"), 1)
+        self.assertEqual(stats["sent"][0]["offered"], "Kim Net")
 
     def test_queue_csv_and_backups(self):
         self.ingest([company("acme", [person("Jane Doe", email="jane@acme.com"),
@@ -513,6 +679,14 @@ class IngestTests(OutreachCase):
 class TopupTests(OutreachCase):
     def topup(self, providers):
         return outreach.topup_command(self.conn, self.settings, self.today, providers, now=self.now)
+
+    def test_spends_nothing_on_a_company_nobody_fits(self):
+        self.add_inbox()
+        self.ingest([company("beta", [person("Bo Kim", email="bo.kim@beta.com", conf=40)])],
+                    jobs=[{**job("beta", title="Data Scientist"), "description": "<p>Python</p>"}])
+        zerobounce = FakeProvider("zerobounce", verdicts={"bo.kim@beta.com": "valid"})
+        stats = self.topup({"zerobounce": zerobounce})
+        self.assertEqual((stats["attempted"], zerobounce.calls), (0, []))
 
     def test_verifies_the_most_senior_person_per_company_until_the_target(self):
         self.settings.warmup = [(2, None)]

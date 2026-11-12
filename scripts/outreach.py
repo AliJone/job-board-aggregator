@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Outreach queue and sender: the steps daily_run.py calls (ingest, topup, run) and the commands you run
-by hand (stop, unstop, status, add-inbox, list-inboxes, pause, resume).
+by hand (stop, unstop, status, add-inbox, ready, list-inboxes, pause, resume).
 
 Zoho's free plan sends over SMTP but has no IMAP, so nothing reads the inbox. When someone replies,
 unsubscribes or bounces, run `outreach.py stop EMAIL --reason ...`: any pending follow-up is cancelled
@@ -12,6 +12,10 @@ Nobody gets a second first email. Before one is sent, the mailbox (one key per m
 their LinkedIn profile and their name at the company domain are checked against everything already
 sent, and the database refuses a second first email to the same mailbox or person. A follow-up goes
 only to the address of its first email, at most once.
+
+A company gets a first email only when one of its postings fits someone on the roster in
+data/talent.json (outreach_match.py); the email names that person's role, years and the skills the
+posting shares with them.
 
 Modes (OUTREACH_MODE): off sends nothing and spends no credits; review writes .eml drafts to
 scripts/output/drafts/YYYY-MM-DD/ and spends credits on top-ups; send delivers through ready inboxes.
@@ -41,12 +45,15 @@ from enrich_leads import (
 )
 from lead_providers import QuotaTracker
 from outreach_compose import BUCKET_ORDER, compose, full_text, lint_copy, lint_message
+from outreach_match import TALENT_FILE, best_fit, job_fit, load_roster
 
 DRAFTS_DIR = os.path.join(OUTPUT_DIR, "drafts")
 BACKUP_DIR = os.path.join(OUTPUT_DIR, "backups")
 METADATA_FILE = os.path.join(OUTPUT_DIR, "metadata.json")
 LOCK_FILE = os.path.join(OUTPUT_DIR, "outreach.lock")
 KEEP_BACKUPS = 14
+# the whole posting, so skills listed near the end still count (p90 is about 7,000 characters)
+EXCERPT_CHARS = 12000
 EXIT_LOCKED = 75
 ISO = "%Y-%m-%dT%H:%M:%SZ"
 CREDIT_PROVIDERS = ("hunter", "tomba", "apollo", "zerobounce")
@@ -80,6 +87,7 @@ class Settings:
     sender_address_line: str = ""
     unsubscribe_address: str = ""
     own_domains: set = field(default_factory=set)
+    roster: list = field(default_factory=list)
 
 
 def parse_warmup(spec):
@@ -120,6 +128,7 @@ def load_settings(env):
         sender_address_line=(env.get("SENDER_ADDRESS_LINE") or "").strip(),
         unsubscribe_address=(env.get("UNSUBSCRIBE_ADDRESS") or "").strip(),
         own_domains={d for d in own if d},
+        roster=load_roster(),
     )
 
 
@@ -170,7 +179,8 @@ def person_blocker(lead, history, suppressed, latest, settings):
         return "company_cooldown"
     if latest and lead.get("job_last_seen") != latest:
         return "job_closed"
-    return None
+    # no_roster_match, years_gap or location_blocker; checked before the top-up spends a credit
+    return best_fit(lead.get("jobs_snapshot") or [], settings.roster)[1]
 
 
 def skip_reason(lead, history, suppressed, latest, settings):
@@ -215,13 +225,16 @@ def cooldown_since(now, settings):
 # INGEST
 # ============================================================
 
-def jobs_snapshot(company_jobs, limit=3):
-    """The JD stays with the lead after the posting closes or the next scrape replaces all_jobs.json."""
-    best = sorted(company_jobs, key=lambda j: -int(j.get("lead_intent_score") or 0))[:limit]
-    return [{"title": j.get("title") or "", "url": j.get("url") or "", "location": j.get("location") or "",
-             "score": int(j.get("lead_intent_score") or 0),
-             "buckets": [b for b in BUCKET_ORDER if (j.get("lead_intent_matches") or {}).get(b)],
-             "excerpt": strip_html(j.get("description") or "")[:1500]} for j in best]
+def jobs_snapshot(company_jobs, limit=3, roster=None):
+    """The JD stays with the lead after the posting closes or the next scrape replaces all_jobs.json.
+    Postings someone on the roster fits come first, then the highest score."""
+    entries = [{"title": j.get("title") or "", "url": j.get("url") or "", "location": j.get("location") or "",
+                "score": int(j.get("lead_intent_score") or 0),
+                "buckets": [b for b in BUCKET_ORDER if (j.get("lead_intent_matches") or {}).get(b)],
+                "terms": {b: t for b, t in (j.get("lead_intent_terms") or {}).items() if b in BUCKET_ORDER},
+                "excerpt": strip_html(j.get("description") or "")[:EXCERPT_CHARS]} for j in company_jobs]
+    entries.sort(key=lambda e: (0 if roster and job_fit(e, roster)[0] else 1, -e["score"]))
+    return entries[:limit]
 
 
 def candidate(email, confidence, status, domain):
@@ -320,7 +333,7 @@ def ingest_command(conn, leads, jobs, metadata, today, settings, now=None, queue
             if company.get("error") or not company.get("company_key"):
                 continue
             key = company["company_key"]
-            snapshot = jobs_snapshot(by_company.get(key) or [])
+            snapshot = jobs_snapshot(by_company.get(key) or [], roster=settings.roster)
             for person in company.get("people") or []:
                 built = lead_fields(company, person, snapshot, scrape_date if key in by_company else None)
                 if built:
@@ -493,20 +506,25 @@ class Delivery:
         self.review = settings.mode == "review"
 
     def first(self, lead):
-        job = (lead.get("jobs_snapshot") or [{}])[0]
-        return self._deliver(lead, "first", compose(lead, job, self.inbox, "first", self.settings), parent=None)
+        fit, reason = best_fit(lead.get("jobs_snapshot") or [], self.settings.roster)
+        if not fit:
+            return self._skip(reason)
+        content = compose(lead, fit["job"], self.inbox, "first", self.settings, fit=fit)
+        return self._deliver(lead, "first", content, parent=None, offered=fit["name"])
 
     def followup(self, parent):
         lead = store.get_lead(self.conn, parent["lead_id"])
-        job = (lead.get("jobs_snapshot") or [{}])[0]
-        content = compose(lead, job, self.inbox, "followup", self.settings, parent_subject=parent["subject"])
-        return self._deliver(lead, "followup", content, parent=parent)
+        fit, _ = best_fit(lead.get("jobs_snapshot") or [], self.settings.roster)
+        job = fit["job"] if fit else (lead.get("jobs_snapshot") or [{}])[0]
+        content = compose(lead, job, self.inbox, "followup", self.settings, parent_subject=parent["subject"],
+                          fit=fit, parent_body=parent.get("body_text"))
+        return self._deliver(lead, "followup", content, parent=parent, offered=fit["name"] if fit else None)
 
     def _skip(self, reason):
         self.stats["skipped_reasons"][reason] += 1
         return False
 
-    def _deliver(self, lead, kind, content, parent):
+    def _deliver(self, lead, kind, content, parent, offered=None):
         to_email = parent["to_email"] if parent else lead["email"]  # a follow-up never changes address
         text = full_text(content["body"], self.settings, self.inbox)
         message_id = mail.new_message_id(self.inbox["address"])
@@ -515,9 +533,15 @@ class Delivery:
                                  in_reply_to=parent["message_id"] if parent else None)
         errors = [t for level, t in lint_copy(content["subject"], content["body"], kind) if level == "error"]
         errors += lint_message(msg, kind)
+        if not self.review and not self.settings.sender_address_line:
+            # US law (CAN-SPAM) wants a postal address in every commercial email
+            errors.append("SENDER_ADDRESS_LINE is empty, so the signature has no postal address")
         if errors:
             self.stats["errors"].append(f"{lead['name']} ({kind}) not sent: {'; '.join(errors)}")
             return self._skip("lint_failed")
+        # offered: whose CV to send when they reply
+        row = {"name": lead["name"], "company": lead.get("company"), "kind": kind, "subject": content["subject"],
+               "email": to_email, "offered": offered}
         fields = dict(message_id=message_id, lead_id=lead["id"], inbox_id=self.inbox["id"], kind=kind,
                       parent_id=parent["id"] if parent else None, to_email=to_email,
                       email_key=store.email_key(to_email), person_key=lead["person_key"],
@@ -531,6 +555,7 @@ class Delivery:
             store.insert_message(self.conn, **fields, status="draft", draft_path=path)
             self.stats["drafts_written"] += 1
             self.stats["drafts"].append(path)
+            self.stats["drafted"].append(row)
             return True
 
         if self.stats["_sent_any"]:
@@ -561,8 +586,7 @@ class Delivery:
         self.stats["_sent_any"] = True
         self.stats["sent_first" if kind == "first" else "sent_followup"] += 1
         self.stats["sent_by_kind"][lead.get("email_kind") or "work"] += 1
-        self.stats["sent"].append({"name": lead["name"], "company": lead.get("company"), "kind": kind,
-                                   "subject": content["subject"], "email": to_email})
+        self.stats["sent"].append(row)
         return True
 
     def close(self):
@@ -597,7 +621,7 @@ def run_command(conn, settings, today, env, now=None, sleep=time.sleep, connect_
     inboxes = store.list_inboxes(conn)
     settings.own_domains |= {store.email_domain(i["address"]) for i in inboxes}
     stats = {"mode": settings.mode, "sent_first": 0, "sent_followup": 0, "drafts_written": 0, "drafts": [],
-             "sent": [], "inboxes": [], "paused_inboxes": [], "skipped_reasons": Counter(),
+             "drafted": [], "sent": [], "inboxes": [], "paused_inboxes": [], "skipped_reasons": Counter(),
              "sent_by_kind": Counter(), "errors": [], "weekend": False, "send_failed": False, "_sent_any": False}
     leads, history, suppressed, latest, eligible, skipped = queue_rows(conn, settings, now)
     stats["eligible_pool"] = len(eligible)
@@ -669,6 +693,8 @@ def run_command(conn, settings, today, env, now=None, sleep=time.sleep, connect_
     if stats["unknown_state"]:
         stats["errors"].append(f"{stats['unknown_state']} message(s) stuck in 'sending' after a crash; they count as "
                                "sent and are never retried")
+    if not settings.roster and settings.mode != "off":
+        stats["errors"].append(f"{TALENT_FILE} is missing or empty, so no first email can be written")
     if not inboxes and settings.mode != "off":
         stats["errors"].append("no sending inbox yet: python scripts/outreach.py add-inbox --address ... "
                                "--display-name ...")
@@ -879,6 +905,10 @@ def build_parser():
     p.add_argument("--pass-env", default="SMTP_PASS", help=".env key holding the password")
     p.add_argument("--no-check", action="store_true", help="skip the SMTP login test")
 
+    p = sub.add_parser("ready", help="let an inbox send and start its warm-up (after an SMTP login test)")
+    p.add_argument("address")
+    p.add_argument("--no-check", action="store_true", help="skip the SMTP login test")
+
     sub.add_parser("list-inboxes", help="list sending inboxes")
     p = sub.add_parser("pause", help="stop sending from an inbox")
     p.add_argument("address")
@@ -944,8 +974,22 @@ def main(argv=None):
                     print("SMTP login: ok")
                 except Exception as exc:
                     print(f"SMTP login failed: {exc.__class__.__name__}: {exc}")
-            print(f"added {args.address} as pending: it drafts in review mode and sends only once the inbox "
-                  "checks mark it ready")
+            print(f"added {args.address} as pending: it drafts in review mode; run "
+                  f"`outreach.py ready {args.address}` to let it send")
+        elif args.command == "ready":
+            inbox = store.get_inbox(conn, args.address)
+            if not inbox:
+                print(f"no inbox {args.address}")
+                return 1
+            if not args.no_check:
+                try:
+                    mail.smtp_connect(inbox, os.environ).quit()
+                except Exception as exc:
+                    print(f"SMTP login failed, {args.address} stays {inbox['status']}: {exc.__class__.__name__}: {exc}")
+                    return 1
+            store.set_inbox_status(conn, inbox["id"], "ready")
+            cap, day = warmup_cap(store.get_inbox(conn, args.address), today, settings.warmup)
+            print(f"{args.address} is ready: warm-up day {day}, up to {cap} emails today once OUTREACH_MODE=send")
         elif args.command == "list-inboxes":
             rows = [[i["address"], i["display_name"], f"{i['smtp_host']}:{i['smtp_port']}", i["status"],
                      (i["warmup_started_at"] or "")[:10], i["paused_reason"] or ""] for i in store.list_inboxes(conn)]

@@ -410,7 +410,8 @@ def resolve_email(person, domain, company, site_emails, pattern, pattern_source,
             finder = providers.get(key)
             if finder and finder.available(1):
                 hit = finder.email_finder(first, last, domain)
-                if hit and consider(hit["email"], hit["confidence"], hit["source"],
+                # a finder's score rates the guess, not the mailbox: keep it under the verified bar so it gets checked
+                if hit and consider(hit["email"], min(hit["confidence"], CONFIDENCE["verified"] - 1), hit["source"],
                                     {"phone": hit.get("phone") or person.get("phone")}):
                     return best
         apollo = providers.get("apollo")

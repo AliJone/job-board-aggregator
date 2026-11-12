@@ -1173,6 +1173,23 @@ LEAD_INTENT_BUCKETS = {
         r"\b(rbac)\b",
         r"\b(role-based access control)\b",
     ]),
+    # Stacks and roles the drawnonward team covers: a fit signal, not a pain signal
+    "teamStack": _compile_bucket_patterns([
+        r"\b(node\.?js|nodejs)\b",
+        r"\b(next\.?js|nextjs)\b",
+        r"\b(nuxt(\.?js)?)\b",
+        r"\b(react(\.?js)?)\b(?! native)",
+        r"\b(react native)\b",
+        r"\b(vue(\.?js)?)\b",
+        r"\b(flutter)\b",
+        r"\b(golang|go developer|go engineer|go microservices)\b",
+        r"(?<![a-z0-9])(\.net|asp\.net|dotnet|c#)(?![a-z0-9])",
+        r"\b(qa automation|test automation|automation testing|sdet|selenium|cypress|playwright|appium)\b",
+        r"\b(manual testing|manual qa|quality assurance)\b",
+        r"\b(devops|kubernetes|terraform|ci/cd|site reliability)\b",
+        r"\b(ui/ux|ux/ui|ux design|ui design|product design|figma)\b",
+        r"\b(project manager|project management|scrum master|pmp)\b",
+    ]),
     "noiseFilter": _compile_bucket_patterns([
         r"\b(bubble\.io)\b",
         r"\b(build a landing page)\b",
@@ -1233,6 +1250,7 @@ LEAD_INTENT_WEIGHTS = {
     "hardSecurity": 3,
     "technicalDebt": 4,
     "manualArchitecture": 2,
+    "teamStack": 2,
     "noiseFilter": -10,
 }
 
@@ -1273,10 +1291,14 @@ def evaluate_lead_intent(job):
     clean_text = normalize_for_scoring(raw_text)
 
     matches = {}
+    terms = {}  # the matched phrases; the outreach follow-up trusts only some of them
     score = 0
     for bucket, patterns in LEAD_INTENT_BUCKETS.items():
-        hit_count = sum(1 for pattern in patterns if pattern.search(clean_text))
+        found = [m.group(0) for m in (pattern.search(clean_text) for pattern in patterns) if m]
+        hit_count = len(found)
         matches[bucket] = (hit_count > 0)
+        if found:
+            terms[bucket] = found
         if hit_count > 0:
             if bucket == "noiseFilter":
                 score += LEAD_INTENT_WEIGHTS[bucket]
@@ -1286,6 +1308,7 @@ def evaluate_lead_intent(job):
     return {
         "score": score,
         "matches": matches,
+        "terms": terms,
         "is_excluded": bool(matches.get("noiseFilter")),
     }
 
@@ -1315,6 +1338,7 @@ def clean_job_data(jobs):
         scoring = evaluate_lead_intent(job)
         job["lead_intent_score"] = scoring["score"]
         job["lead_intent_matches"] = scoring.get("matches", {})
+        job["lead_intent_terms"] = scoring.get("terms", {})
         if scoring["is_excluded"]:
             skipped_reasons["low_signal"] += 1
             continue

@@ -34,6 +34,30 @@ class LeadIntentScoringTests(unittest.TestCase):
         self.assertEqual(len(cleaned), 1)
         self.assertEqual(cleaned[0]["title"], "Senior Platform Engineer")
 
+    def test_terms_record_the_matched_phrases(self):
+        result = evaluate_lead_intent({"title": "Engineer", "company": "Example",
+                                       "description": "Pay down technical debt in our React app."})
+        self.assertEqual(result["terms"]["technicalDebt"], ["technical debt"])
+        self.assertEqual(result["terms"]["teamStack"], ["react"])
+        self.assertNotIn("highScale", result["terms"])
+
+    def test_team_stack_is_a_capped_fit_signal(self):
+        result = evaluate_lead_intent({"title": "Senior Full Stack Engineer", "company": "Example",
+                                       "description": "We build with React, Node.js, Next.js, Nuxt and Vue."})
+        self.assertTrue(result["matches"]["teamStack"])
+        self.assertEqual(result["score"], 6)  # 2 per hit, at most 3 hits
+
+    def test_team_stack_ignores_lookalikes(self):
+        result = evaluate_lead_intent({"title": "Account Executive", "company": "Example",
+                                       "description": "Go to market with partners at example.net; C level buyers."})
+        self.assertFalse(result["matches"]["teamStack"])
+        self.assertEqual(result["score"], 0)
+
+    def test_team_stack_reads_dotnet_go_and_qa(self):
+        result = evaluate_lead_intent({"title": "SDET", "company": "Example",
+                                       "description": "ASP.NET and C# services, golang workers, Playwright suites."})
+        self.assertEqual(result["score"], 6)
+
 
 if __name__ == "__main__":
     unittest.main()
