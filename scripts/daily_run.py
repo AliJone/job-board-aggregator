@@ -622,7 +622,7 @@ def summary_blocks(summary, record):
             line += (f" {_plural(drafts, 'draft')} {'is' if drafts == 1 else 'are'} waiting for review in "
                      f"scripts/output/drafts/{record.get('run_date')}/.")
         add(("p", line))
-        # Offered is whose CV to send when they reply
+        # Offered is the profile the email pitched
         if outreach.get("sent"):
             add(("table", ["Name", "Company", "Kind", "Subject", "Offered"],
                  [[m.get("name"), m.get("company"), m.get("kind"), m.get("subject"), m.get("offered")]

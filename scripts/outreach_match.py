@@ -221,3 +221,9 @@ def best_fit(jobs, roster):
         else:
             _fit_cache[key] = (None, next((r for r in reasons if r != "no_roster_match"), "no_roster_match"))
     return _fit_cache[key]
+
+
+def describe(fit):
+    """The profile an email offered, for the summary: role, years and the skills it named. The roster needs no names."""
+    skills = ", ".join(fit["skills"])
+    return f"{fit['role']}, {fit['years_text']}" + (f": {skills}" if skills else "")

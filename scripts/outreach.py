@@ -45,7 +45,7 @@ from enrich_leads import (
 )
 from lead_providers import QuotaTracker
 from outreach_compose import BUCKET_ORDER, compose, full_text, lint_copy, lint_message
-from outreach_match import TALENT_FILE, best_fit, job_fit, load_roster
+from outreach_match import TALENT_FILE, best_fit, describe, job_fit, load_roster
 
 DRAFTS_DIR = os.path.join(OUTPUT_DIR, "drafts")
 BACKUP_DIR = os.path.join(OUTPUT_DIR, "backups")
@@ -510,7 +510,7 @@ class Delivery:
         if not fit:
             return self._skip(reason)
         content = compose(lead, fit["job"], self.inbox, "first", self.settings, fit=fit)
-        return self._deliver(lead, "first", content, parent=None, offered=fit["name"])
+        return self._deliver(lead, "first", content, parent=None, offered=describe(fit))
 
     def followup(self, parent):
         lead = store.get_lead(self.conn, parent["lead_id"])
@@ -518,7 +518,7 @@ class Delivery:
         job = fit["job"] if fit else (lead.get("jobs_snapshot") or [{}])[0]
         content = compose(lead, job, self.inbox, "followup", self.settings, parent_subject=parent["subject"],
                           fit=fit, parent_body=parent.get("body_text"))
-        return self._deliver(lead, "followup", content, parent=parent, offered=fit["name"] if fit else None)
+        return self._deliver(lead, "followup", content, parent=parent, offered=describe(fit) if fit else None)
 
     def _skip(self, reason):
         self.stats["skipped_reasons"][reason] += 1
@@ -539,7 +539,7 @@ class Delivery:
         if errors:
             self.stats["errors"].append(f"{lead['name']} ({kind}) not sent: {'; '.join(errors)}")
             return self._skip("lint_failed")
-        # offered: whose CV to send when they reply
+        # offered: the profile the email pitched, so the right CV goes out when they reply
         row = {"name": lead["name"], "company": lead.get("company"), "kind": kind, "subject": content["subject"],
                "email": to_email, "offered": offered}
         fields = dict(message_id=message_id, lead_id=lead["id"], inbox_id=self.inbox["id"], kind=kind,

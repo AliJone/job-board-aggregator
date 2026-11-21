@@ -656,7 +656,7 @@ class IngestTests(OutreachCase):
         stats = self.send()
         self.assertEqual(self.sent_to(), ["Jane Doe <jane@acme.com>"])
         self.assertEqual(stats["skipped_reasons"].get("no_roster_match"), 1)
-        self.assertEqual(stats["sent"][0]["offered"], "Kim Net")
+        self.assertEqual(stats["sent"][0]["offered"], "full-stack engineer, 8 years: React, Node")
 
     def test_queue_csv_and_backups(self):
         self.ingest([company("acme", [person("Jane Doe", email="jane@acme.com"),

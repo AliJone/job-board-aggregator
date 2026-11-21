@@ -461,8 +461,8 @@ Want me to send the CV?
 QA names one skill with its own years ("5 years of test automation, which your
 posting asks for"); design and DevOps without listed tools give role and years;
 project management adds "and multiple certifications". "senior" is used from 5
-years up. The person is never named in the email; the summary's Offered column
-says whose CV to send when they reply. The follow-up, 7 days later in the same
+years up. The person is never named in the email, and the roster needs no names;
+the summary's Offered column shows the profile the email pitched. The follow-up, 7 days later in the same
 thread:
 
 ```
