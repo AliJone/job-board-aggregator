@@ -33,6 +33,7 @@ import random
 import re
 import sys
 import time
+import unicodedata
 from collections import defaultdict
 from html import unescape
 from urllib.parse import urlparse
@@ -212,6 +213,8 @@ def parse_linkedin_title(title):
     """'Jane Doe - CTO - Acme | LinkedIn' -> ('Jane Doe', 'CTO', 'Acme'), else None."""
     if not title:
         return None
+    # Brave titles carry invisible direction marks that would end up in the greeting
+    title = "".join(ch for ch in title if unicodedata.category(ch) != "Cf")
     text = re.sub(r"\s*[|\-–—]\s*LinkedIn\s*$", "", title.strip(), flags=re.IGNORECASE)
     parts = [p.strip() for p in re.split(r"\s+[-–—]\s+", text) if p.strip()]
     if len(parts) < 2:
@@ -359,7 +362,15 @@ def linkedin_query(company):
     return f'"{company}" (CTO OR "VP Engineering" OR "Head of Engineering" OR founder OR CEO) site:linkedin.com/in'
 
 
-def people_from_results(results, company, source):
+def brand_in_slug(listed_company, company, domain):
+    """Profiles say 'HighLevel' where the job board says 'Gohighlevel': accept a profile company of 5+
+    letters found inside the posting's company name or the site's domain label."""
+    listed = re.sub(r"[^a-z0-9]", "", (listed_company or "").lower())
+    names = [re.sub(r"[^a-z0-9]", "", (n or "").lower()) for n in (company, (domain or "").split(".")[0])]
+    return len(listed) >= 5 and any(listed in n for n in names if n)
+
+
+def people_from_results(results, company, source, domain=None):
     people = []
     for r in results or []:
         parsed = parse_linkedin_title(r.get("title", ""))
@@ -368,7 +379,8 @@ def people_from_results(results, company, source):
         name, role, listed_company = parsed
         if seniority(role) < 0:
             continue
-        if not company_mentioned(company, f"{role} {listed_company} {r.get('body', '')}"):
+        if not (company_mentioned(company, f"{role} {listed_company} {r.get('body', '')}")
+                or brand_in_slug(listed_company, company, domain)):
             continue
         people.append({"name": name, "title": role, "company_on_profile": listed_company,
                        "linkedin": r.get("href", ""), "snippet": (r.get("body") or "")[:300],
@@ -585,7 +597,7 @@ def discover_people(company, domain, searchers, providers, k):
     """Collect candidates from search engines, Apollo, then Hunter/Tomba domain search if still short."""
     people, pattern, pattern_source = [], None, None
     for label, search in searchers:
-        people += people_from_results(search(linkedin_query(company)), company, label)
+        people += people_from_results(search(linkedin_query(company)), company, label, domain)
         if len(select_decision_makers(dedupe_people(people), k)) >= k:
             break
 

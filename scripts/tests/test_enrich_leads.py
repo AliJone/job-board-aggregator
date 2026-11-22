@@ -8,6 +8,7 @@ from unittest import mock
 from enrich_leads import (
     CONFIDENCE,
     DDG_THROTTLED,
+    brand_in_slug,
     build_searchers,
     clearbit_domain,
     ddg_search,
@@ -17,6 +18,7 @@ from enrich_leads import (
     humanize_company,
     load_cache,
     parse_linkedin_title,
+    people_from_results,
     pick_company_domain,
     rank_companies,
     registered_domain,
@@ -73,6 +75,18 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(parse_linkedin_title("John Smith - VP Engineering at Acme | LinkedIn"),
                          ("John Smith", "VP Engineering", "Acme"))
         self.assertIsNone(parse_linkedin_title("Acme | LinkedIn"))
+
+    def test_invisible_marks_are_stripped(self):
+        self.assertEqual(parse_linkedin_title("\u200fVarun Vairavan\u200f - \u200fCo-Founder at HighLevel\u200f"),
+                         ("Varun Vairavan", "Co-Founder", "HighLevel"))
+
+    def test_profile_brand_inside_slug_matches(self):
+        results = [{"title": "Robin Alex - Co-Founder at HighLevel", "href": "https://linkedin.com/in/r", "body": ""}]
+        self.assertEqual([p["name"] for p in people_from_results(results, "Gohighlevel", "brave", "gohighlevel.com")],
+                         ["Robin Alex"])
+        self.assertTrue(brand_in_slug("HighLevel", "Gohighlevel", None))
+        self.assertFalse(brand_in_slug("High", "Gohighlevel", None))  # too short to trust
+        self.assertFalse(brand_in_slug("OtherCo", "Gohighlevel", "gohighlevel.com"))
 
     def test_registered_domain(self):
         self.assertEqual(registered_domain("https://www.acme.com/about"), "acme.com")
