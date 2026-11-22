@@ -46,6 +46,12 @@ SLUG_SUFFIXES = {"ai": "AI", "hq": "HQ", "labs": "Labs"}
 LAUNCH_PREFIXES = ("get", "try", "use", "join", "hey", "hello", "meet", "with", "go")
 # 1 to 3 capitalised words starting at every word, overlapping
 NAME_SPANS_RE = re.compile(r"(?=(\b[A-Z][\w&.'-]*(?:[ \t]+[A-Z0-9][\w&.'-]*){0,2}))")
+# Client review, quoted word for word; each email uses a different part so the follow-up adds something new
+PROOF_FIRST = ("SayHisaab's founder and CEO, Zain Raza, hired tech leads through us and wrote that they "
+               "\"brought excellent technical knowledge to the table\" and went \"above and beyond what was expected.\"")
+PROOF_FOLLOWUP = ("When SayHisaab hired tech leads through us, its founder wrote that they \"seamlessly integrated "
+                  "into our company culture right from the start.\"")
+SERVICE_URL = "https://drawnonward.org/services/tech-leads-for-hire/"
 WORD_LIMITS = {"first": (50, 120), "followup": (20, 120)}
 MAX_SUBJECT_WORDS = 6
 
@@ -172,6 +178,8 @@ def compose(lead, job, inbox, kind, settings, parent_subject=None, fit=None, par
                      "When a senior seat sits empty, the rest of the team picks up its work. "
                      f"The {role} I mentioned can take some of that on while you keep looking for the right hire, "
                      "so you do not have to rush it or settle.\n\n"
+                     f"{PROOF_FOLLOWUP}\n\n"
+                     f"How it works: {SERVICE_URL}\n\n"
                      "Reply \"CV\" and I will send it over."),
         }
     if not fit:
@@ -183,7 +191,7 @@ def compose(lead, job, inbox, kind, settings, parent_subject=None, fit=None, par
                  f"I saw the {title} role at {company}.\n\n"
                  f"{offer_line(fit)} They can join your team through us.\n\n"
                  "You skip the search. Read one CV, talk with them if it looks right, then decide.\n\n"
-                 f"I run {settings.agency_name}, a software agency in Karachi.\n\n"
+                 f"I run {settings.agency_name}, a software agency in Karachi. {PROOF_FIRST}\n\n"
                  "Want me to send the CV?"),
     }
 

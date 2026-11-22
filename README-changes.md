@@ -454,7 +454,9 @@ from your posting. They can join your team through us.
 
 You skip the search. Read one CV, talk with them if it looks right, then decide.
 
-I run drawnonward, a software agency in Karachi.
+I run drawnonward, a software agency in Karachi. SayHisaab's founder and CEO,
+Zain Raza, hired tech leads through us and wrote that they "brought excellent
+technical knowledge to the table" and went "above and beyond what was expected."
 
 Want me to send the CV?
 ```
@@ -475,6 +477,11 @@ One more thought on the <job title> role. From the posting, the work involves
 When a senior seat sits empty, the rest of the team picks up its work. The
 <role> I mentioned can take some of that on while you keep looking for the right
 hire, so you do not have to rush it or settle.
+
+When SayHisaab hired tech leads through us, its founder wrote that they
+"seamlessly integrated into our company culture right from the start."
+
+How it works: https://drawnonward.org/services/tech-leads-for-hire/
 
 Reply "CV" and I will send it over.
 ```

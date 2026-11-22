@@ -539,6 +539,9 @@ class ComposeTests(unittest.TestCase):
         self.assertEqual(follow["subject"], "Re: Your Staff Software Engineer role")
         self.assertIn("role. From the posting, the work involves data that has to stay correct,", follow["body"])
         self.assertIn("The full-stack engineer I mentioned", follow["body"])
+        self.assertIn("went \"above and beyond what was expected.\"", first["body"])
+        self.assertIn("seamlessly integrated into our company culture", follow["body"])
+        self.assertIn("How it works: https://drawnonward.org/services/tech-leads-for-hire/", follow["body"])
         self.assertEqual(lint_copy(first["subject"], first["body"], "first"), [])
         self.assertEqual(lint_copy(follow["subject"], follow["body"], "followup"), [])
 
