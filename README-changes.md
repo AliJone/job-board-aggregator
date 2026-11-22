@@ -232,9 +232,10 @@ them offers API access on a free plan.
 
 ### Per company
 
-1. Website domain from a search, skipping job boards, social sites and data
-   brokers.
-2. Candidates from DuckDuckGo and Brave LinkedIn results, Apollo people
+1. Website domain from Clearbit's free company lookup, else from a search,
+   skipping job boards, social sites and data brokers.
+2. Candidates from Brave (first, when keyed) and `SEARCH_BACKENDS` LinkedIn
+   results (DuckDuckGo refuses datacenter addresses; `none` skips it), Apollo people
    search, and Hunter or Tomba domain search when fewer than `--people`
    decision makers were found so far. Records for the same person are merged.
 3. Published emails and phones from the company's home, contact, about, team

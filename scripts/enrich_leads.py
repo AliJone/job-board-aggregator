@@ -188,6 +188,26 @@ def pick_company_domain(company, results):
     return fallback
 
 
+CLEARBIT_SUGGEST = "https://autocomplete.clearbit.com/v1/companies/suggest"
+
+
+def clearbit_domain(company, session):
+    """Website from Clearbit's free company lookup: no key, and it answers from datacenter addresses that
+    search engines refuse. None unless a hit's domain or name matches the company."""
+    try:
+        resp = session.request("GET", CLEARBIT_SUGGEST, params={"query": company}, timeout=10)
+        hits = resp.json() if resp.status_code == 200 else []
+    except (requests.RequestException, ValueError):
+        return None
+    tokens = company_tokens(company)
+    for hit in hits or []:
+        dom = (hit.get("domain") or "").lower()
+        if dom and (any(t in dom.replace("-", "") for t in tokens)
+                    or norm_name(hit.get("name")) == norm_name(company)):
+            return dom
+    return None
+
+
 def parse_linkedin_title(title):
     """'Jane Doe - CTO - Acme | LinkedIn' -> ('Jane Doe', 'CTO', 'Acme'), else None."""
     if not title:
@@ -488,10 +508,10 @@ def resolve_phone(person, providers, company_phones):
 # SEARCH, SITE, LLM
 # ============================================================
 
-def ddg_search(ddg, query, max_results=10, retries=3):
+def ddg_search(ddg, query, max_results=10, retries=3, backend="auto"):
     for attempt in range(retries + 1):
         try:
-            results = list(ddg.text(query, max_results=max_results) or [])
+            results = list(ddg.text(query, max_results=max_results, backend=backend) or [])
             time.sleep(random.uniform(2.0, 4.0))  # DDG blocks bursts
             return results
         except Exception as exc:
@@ -596,27 +616,37 @@ def split_providers(providers, discover_only):
             {k: v for k, v in providers.items() if k == "github"})
 
 
+def build_searchers(ddg, brave, backends):
+    """Engines in the order tried. Brave first when keyed: it answers from any address and its cap keeps it
+    inside the free credit. Then the ddgs engines in SEARCH_BACKENDS; 'none' skips them on a host they refuse."""
+    searchers = []
+    if brave:
+        searchers.append(("brave", lambda q: brave.search(q)))
+    if backends != "none":
+        searchers.append(("duckduckgo", lambda q: ddg_search(ddg, q, 10, backend=backends)))
+    return searchers
+
+
 def enrich_company(entry, ddg, session, providers, client, args):
     company = entry["company"]
     print(f"\n[{company}] score {entry['max_score']} | {entry['job_count']} jobs")
     providers, resolvers = split_providers(providers, getattr(args, "discover_only", False))
 
-    searchers = [("duckduckgo", lambda q: ddg_search(ddg, q, 10))]
-    brave = providers.get("brave")
-    if brave:
-        searchers.append(("brave", lambda q: brave.search(q)))
+    searchers = build_searchers(ddg, providers.get("brave"), args.search_backends)
 
-    site_results = searchers[0][1](f'"{company}" official website')
-    if not site_results and brave:
-        site_results = brave.search(f'"{company}" official website')
-    domain = pick_company_domain(company, site_results)
+    domain, site_results = clearbit_domain(company, session), []
+    for _, search in searchers:
+        if domain:
+            break
+        site_results = search(f'"{company}" official website')
+        domain = pick_company_domain(company, site_results)
     print(f"  domain: {domain or 'not found'}")
 
     emails, phones, site_text = fetch_site_contacts(domain, session) if domain else ([], [], "")
     people, pattern, pattern_source = discover_people(company, domain, searchers, providers, args.people)
     print(f"  candidates: {len(people)} | site: {len(emails)} emails, {len(phones)} phones")
 
-    if client:
+    if client and (site_results or people or emails or site_text):  # nothing found: save the free daily calls
         snippets = [f"{r.get('title', '')} - {r.get('body', '')}" for r in site_results]
         cleaned = llm_cleanup(client, company, domain, people, emails, phones, site_text, snippets)
         if cleaned:
@@ -757,11 +787,14 @@ def main():
                         help="redo cached companies older than this many days (0 = keep forever)")
     parser.add_argument("--max-minutes", type=float, default=0,
                         help="stop after this many minutes and write what is done; rerun resumes (0 = no limit)")
+    parser.add_argument("--search-backends", default=None,
+                        help="ddgs engines for searches, e.g. yandex,google; none = Brave only (default: SEARCH_BACKENDS or auto)")
     args = parser.parse_args()
 
     if DDGS is None:
         sys.exit("ddgs is not installed: pip install ddgs")
     load_dotenv(ENV_FILE)
+    args.search_backends = args.search_backends or os.environ.get("SEARCH_BACKENDS") or "auto"
 
     with open(args.input, encoding="utf-8") as f:
         jobs = json.load(f)

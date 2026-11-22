@@ -8,6 +8,8 @@ from unittest import mock
 from enrich_leads import (
     CONFIDENCE,
     DDG_THROTTLED,
+    build_searchers,
+    clearbit_domain,
     ddg_search,
     dedupe_people,
     detect_pattern,
@@ -270,7 +272,7 @@ class FakeDDG:
     def __init__(self, outcomes):
         self.outcomes, self.calls = outcomes, 0
 
-    def text(self, query, max_results=10):
+    def text(self, query, max_results=10, backend="auto"):
         self.calls += 1
         outcome = self.outcomes.pop(0)
         if isinstance(outcome, Exception):
@@ -409,6 +411,25 @@ class DuckDuckGoBackoffTests(ClockTestCase):
         ddg = FakeDDG([throttled, throttled, [{"href": "https://acme.com"}]])
         self.assertEqual(ddg_search(ddg, "q"), [{"href": "https://acme.com"}])
         self.assertTrue(12 <= self.clock.slept[0] <= 18 and 24 <= self.clock.slept[1] <= 36)
+
+
+class ClearbitDomainTests(unittest.TestCase):
+    def test_matching_hit_wins_and_lookalikes_are_skipped(self):
+        session = FakeSession([FakeResponse(200, [{"name": "GoHighLevel Experts", "domain": "dagenmedia.com"},
+                                                  {"name": "HighLevel", "domain": "gohighlevel.com"}])])
+        self.assertEqual(clearbit_domain("Gohighlevel", session), "gohighlevel.com")
+
+    def test_no_match_or_error_gives_none(self):
+        self.assertIsNone(clearbit_domain("Acme", FakeSession([FakeResponse(200, [{"name": "Other", "domain": "other.com"}])])))
+        self.assertIsNone(clearbit_domain("Acme", FakeSession([FakeResponse(503)])))
+
+
+class SearcherOrderTests(unittest.TestCase):
+    def test_brave_first_and_none_skips_ddgs(self):
+        brave = type("Brave", (), {"search": lambda self, q: []})()
+        self.assertEqual([n for n, _ in build_searchers(None, brave, "yandex,google")], ["brave", "duckduckgo"])
+        self.assertEqual([n for n, _ in build_searchers(None, None, "auto")], ["duckduckgo"])
+        self.assertEqual(build_searchers(None, None, "none"), [])
 
 
 if __name__ == "__main__":
